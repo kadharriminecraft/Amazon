@@ -40,10 +40,11 @@
      detected automatically and the log survives restarts.
 
    Access control - TWO profiles (edit ACCESS_KEYS below):
-     "Notblocked" -> full     : normal, unrestricted browsing
-     "MissionaryAmazon"    -> filtered : Safe Mode. Searches, results, charts and
-                             product pages containing adult or sexual
-                             content are blocked here in the worker -
+     "notblocked"        -> full     : normal, unrestricted browsing
+     "Missionary Amazon"  -> filtered : Safe Mode. Searches, results,
+                             charts and product pages containing adult
+                             or sexual content are blocked here in the
+                             worker -
                              the app cannot bypass it. The word list is
                              BLOCKED_TERMS further down; edit freely.
                              Generic words (underwear, pajamas, swimsuit,
@@ -59,6 +60,13 @@
      "x-access-key" (or ?key=<key>). Leave the map EMPTY {} to
      disable the gate entirely (anyone with the URL gets full access).
 
+   Cache wipe (for clean Safe Mode testing):
+     GET /api/cache-wipe  -> drops every cached product page, search
+     and chart at the edge, so the next request fetches fresh from
+     Amazon. The app calls this automatically whenever the access
+     key changes, so switching between profiles never shows stale
+     results from the other profile. Needs any valid access key.
+
    Notes:
      - Amazon throttles datacenter IPs with bot-check pages: a 503
        captcha page, or a ~2 KB Akamai challenge shell (bm-verify) that
@@ -70,7 +78,10 @@
        an empty "no results" answer.
      - Responses are cached at the Cloudflare edge (search 10 min,
        product 1 h, charts 15 min) to make repeat browsing instant and
-       to reduce the chance of hitting the bot check.
+       to reduce the chance of hitting the bot check. The edge cache
+       holds the RAW extraction and Safe Mode filtering re-runs on
+       every request, and all client responses are marked no-store,
+       so switching access keys always shows the right items.
 ===================================================================== */
 
 const AMAZON = 'https://www.amazon.com';
@@ -81,10 +92,11 @@ const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 /* Access-key -> profile map. 'full' = unrestricted, 'filtered' = Safe Mode.
- * Rename keys / add entries as you like; {} disables the gate entirely. */
+ * Rename keys / add entries as you like; {} disables the gate entirely.
+ * Keys are matched EXACTLY (after trimming spaces), capitals included. */
 const ACCESS_KEYS = {
-  unblock: 'full',
-  safe: 'filtered',
+  notblocked: 'full',
+  'Missionary Amazon': 'filtered',
 };
 
 /* Password for the /admin/stats filter monitor (used by amazon-admin.html).
@@ -490,6 +502,7 @@ function sanitizeProduct(p, related) {
 /* ================================================================== */
 
 const STATS_KV_KEY = 'filter-stats-v1';
+const CACHE_GEN_KV_KEY = 'cache-generation-v1';
 const MAX_STATS_EVENTS = 500;
 
 function zeroTotals() {
@@ -505,7 +518,15 @@ const stats = {
 
 let statsLoadPromise = null;
 
-/* one-time per isolate: pull the saved log from KV when one is bound */
+/* Cache generation: bumped by /api/cache-wipe. Every edge-cache key
+ * embeds it, so a bump instantly orphans all cached products, searches
+ * and charts (they expire on their own). Persisted in the FILTER_STATS
+ * KV namespace when one is bound, so the wipe survives isolate
+ * restarts; without KV it applies to the current isolate only. */
+let cacheGen = 0;
+
+/* one-time per isolate: pull the saved log + cache generation from KV
+ * when a namespace is bound */
 function loadStats(env) {
   if (!statsLoadPromise) {
     statsLoadPromise = (async () => {
@@ -522,6 +543,9 @@ function loadStats(env) {
               stats.queryCounts = s.queryCounts || {};
             }
           }
+          const g = await env.FILTER_STATS.get(CACHE_GEN_KV_KEY);
+          const n = parseInt(g || '', 10);
+          if (!isNaN(n) && n > 0) cacheGen = n;
         }
       } catch (e) {}
     })();
@@ -596,6 +620,7 @@ export default {
       if (p === '/img') {
         return await proxyImage(ctx, url.searchParams.get('u') || '');
       }
+      if (p === '/api/cache-wipe') return handleCacheWipe(url, ctx, env);
       if (p === '/api/search') return await handleSearch(url, ctx, profile, env);
       if (p.startsWith('/api/product/')) return await handleProduct(url, ctx, profile, env);
       if (p === '/api/browse') return await handleBrowse(url, ctx, profile, env);
@@ -626,7 +651,11 @@ function jsonResponse(data, status = 200, extra = {}) {
     status,
     headers: {
       'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'public, max-age=120',
+      /* no-store: the phone's browser must never replay a response that
+       * was filtered for a DIFFERENT access key after the user switched
+       * keys. Caching happens inside the worker (cachedData), which
+       * re-runs the Safe Mode filter on every request anyway. */
+      'cache-control': 'no-store',
       ...CORS,
       ...extra,
     },
@@ -794,10 +823,12 @@ async function getAmazonHTML(target) {
  * DATA (not a Response) - callers still run their per-request logic
  * (Safe Mode filtering + activity logging) on cache hits. The cached
  * payload is worker-internal: it holds the RAW unfiltered extraction
- * and is never sent anywhere until the caller has filtered it. */
+ * and is never sent anywhere until the caller has filtered it.
+ * The key embeds the cache generation, so /api/cache-wipe (which bumps
+ * it) makes every old entry unreachable at once. */
 async function cachedData(ctx, key, ttlSec, producer) {
   const cache = caches.default;
-  const req = new Request('https://jsoncache.relay/' + encodeURIComponent(key));
+  const req = new Request('https://jsoncache.relay/' + cacheGen + '/' + encodeURIComponent(key));
 
   let hit = null;
   try {
@@ -1019,6 +1050,20 @@ async function runExtractor(rawHtml, mode, asin) {
   let cur = null;
   const flushers = [];
 
+  /* --- browse charts: category sections --- */
+  /* Chart pages stack category carousels, each introduced by a heading
+   * like "New Releases in Kitchen & Dining". Headings are collected
+   * with the same collector machinery; every tile remembers the section
+   * that was open when it STARTED, so a heading between two tiles can
+   * never steal the earlier tile (HTMLRewriter has no end tags). */
+  const sections = [];
+  let curSection = null;
+  const openSection = (title) => {
+    curSection = { title: title || '', tiles: [] };
+    sections.push(curSection);
+    return curSection;
+  };
+
   /* Text of an element often only flushes when the NEXT element matching
    * the same selector opens (HTMLRewriter has no end-tag callbacks). That
    * next element usually sits in the FOLLOWING tile - so before a tile is
@@ -1070,7 +1115,7 @@ async function runExtractor(rawHtml, mode, asin) {
     if (title) title = cleanText(title).slice(0, 300);
 
     if (t.img) {
-      tiles.push({
+      const tile = {
         asin: t.asin,
         title,
         img: t.img,
@@ -1080,7 +1125,10 @@ async function runExtractor(rawHtml, mode, asin) {
         reviews: t.reviews || null,
         sponsored: !!t.sponsored,
         rank: t.rank || null,
-      });
+      };
+      tiles.push(tile);
+      const sec = t.sec || curSection || openSection('');
+      sec.tiles.push(tile);
     }
   }
 
@@ -1102,6 +1150,7 @@ async function runExtractor(rawHtml, mode, asin) {
         reviews: '',
         sponsored: false,
         rank: '',
+        sec: curSection, /* section this tile belongs to (browse mode) */
       };
     },
   };
@@ -1254,6 +1303,23 @@ async function runExtractor(rawHtml, mode, asin) {
     .on('div[data-asin] span[aria-label*="Ratings"]', reviewsAltT)
     .on('div[data-asin] span.zg-bdg-text', rankT)
     .on('div[data-asin] img', imgT);
+
+  /* browse charts only: the carousel headings ("New Releases in ...")
+   * that label each category section. The heading's text flushes when
+   * the first tile after it opens (flushAll inside tileOpen) or when
+   * the next heading opens - both attribute it to the section object
+   * captured when the heading element STARTED. */
+  if (mode === 'browse') {
+    rw = rw.on(
+      '.a-carousel-heading',
+      makeCollector(
+        (text, tgt) => {
+          if (tgt) tgt.title = text;
+        },
+        () => openSection('')
+      )
+    );
+  }
 
   /* --- product-page fields --- */
   let product = null;
@@ -1503,7 +1569,21 @@ async function runExtractor(rawHtml, mode, asin) {
     const selfAsin = (asin || '').toUpperCase();
     return { product: assembleProduct(product), related: outTiles.filter((t) => t.asin !== selfAsin).slice(0, 16) };
   }
-  return { tiles: outTiles.slice(0, 72) };
+
+  /* sections follow the same dedupe: a tile repeated in a later
+   * carousel stays in the first section that carried it */
+  const seenSec = new Set();
+  const outSections = [];
+  for (const sec of sections) {
+    const st = [];
+    for (const t of sec.tiles) {
+      if (seenSec.has(t.asin)) continue;
+      seenSec.add(t.asin);
+      st.push(t);
+    }
+    if (st.length) outSections.push({ title: sec.title, tiles: st.slice(0, 12) });
+  }
+  return { tiles: outTiles.slice(0, 72), sections: outSections.slice(0, 12) };
 }
 
 /* ================================================================== */
@@ -1807,7 +1887,42 @@ async function handleProduct(url, ctx, profile, env) {
   return jsonResponse({ ...data.product, related: data.related });
 }
 
+/* ---------- cache wipe ---------- */
+
+/* Bumps the cache generation: every cached search, product and chart
+ * becomes unreachable and the next request re-fetches from Amazon.
+ * Any valid access key may call it (the app does so automatically when
+ * the key changes, so switching between Safe Mode and full access
+ * always gives accurate results). */
+function handleCacheWipe(url, ctx, env) {
+  cacheGen++;
+  try {
+    if (env && env.FILTER_STATS && typeof env.FILTER_STATS.put === 'function') {
+      const put = env.FILTER_STATS.put(CACHE_GEN_KV_KEY, String(cacheGen)).catch(() => {});
+      if (ctx && ctx.waitUntil) ctx.waitUntil(put);
+    }
+  } catch (e) {}
+  return jsonResponse({ ok: true, wiped: true, generation: cacheGen }, 200, {
+    'cache-control': 'no-store',
+  });
+}
+
 /* ---------- charts ---------- */
+
+/* Chart pages (bestsellers / new releases / movers) are stacks of
+ * category carousels: "New Releases in Kitchen & Dining", "... in
+ * Clothing, Shoes & Jewelry", ... Strip the chart-type prefix so the
+ * app can show a small, clean label above each group. */
+function cleanSectionTitle(t) {
+  return String(t || '')
+    .replace(
+      /^(?:amazon\s+)?(?:new releases|best sellers|movers\s*(?:&|and)?\s*shakers|most\s*wished\s*for|most\s*gifted)\s+in\s+/i,
+      ''
+    )
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60);
+}
 
 async function handleBrowse(url, ctx, profile, env) {
   const typeRaw = url.searchParams.get('type') || 'bestsellers';
@@ -1818,22 +1933,42 @@ async function handleBrowse(url, ctx, profile, env) {
 
   const data = await cachedData(ctx, 'browse|' + type + '|' + catOk, TTL.browse, async () => {
     const html = await getAmazonHTML(target);
-    const { tiles } = await runExtractor(html, 'browse', null);
+    const { tiles, sections } = await runExtractor(html, 'browse', null);
     /* charts always contain tiles; zero means we were walled */
     if (!tiles.length) throw new BlockedError('Chart page was not readable');
-    return { tiles };
+    return { tiles, sections };
   });
+
+  /* split the raw tiles into labeled sections (falling back to one
+   * flat list when the page had no headings we recognized) */
+  const rawSections =
+    data.sections && data.sections.length
+      ? data.sections
+      : [{ title: '', tiles: data.tiles }];
+
+  let sections = rawSections.map((s) => ({
+    title: cleanSectionTitle(s.title),
+    items: s.tiles,
+  }));
 
   let items = data.tiles;
   if (profile === 'filtered') {
-    const kept = [];
+    const keptAll = [];
     const removed = [];
-    for (const t of data.tiles) {
-      const term = tileBlockedTerm(t);
-      if (term) removed.push({ title: String(t.title || '').slice(0, 140), asin: t.asin, reason: term });
-      else kept.push(t);
-    }
-    items = kept;
+    sections = sections
+      .map((s) => {
+        const kept = [];
+        for (const t of s.items || []) {
+          const term = tileBlockedTerm(t);
+          if (term) removed.push({ title: String(t.title || '').slice(0, 140), asin: t.asin, reason: term });
+          else kept.push(t);
+        }
+        keptAll.push(...kept);
+        return { title: s.title, items: kept };
+      })
+      /* sections whose every item was filtered away disappear */
+      .filter((s) => s.items.length);
+    items = keptAll;
     if (removed.length) {
       logStats(env, ctx, {
         type: 'results',
@@ -1841,9 +1976,9 @@ async function handleBrowse(url, ctx, profile, env) {
         q: type + (catOk ? ' - ' + catOk : ''),
         removed: removed.slice(0, 25),
         count: removed.length,
-        shown: kept.length,
+        shown: keptAll.length,
       });
     }
   }
-  return jsonResponse({ type, cat: catOk, items });
+  return jsonResponse({ type, cat: catOk, items, sections });
 }
