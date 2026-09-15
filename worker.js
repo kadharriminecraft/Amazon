@@ -10,19 +10,31 @@
      Amazon directly. The phone only ever talks to this worker.
 
    Endpoints (all GET, CORS: *):
-     /health                                -> { ok: true }
-     /api/search?q=...&page=N&i=INDEX       -> search results (JSON)
+     /health                                -> { ok: true, profile }
+                                            profile = "full" or "filtered"
+     /api/search?q=...&page=N&i=INDEX       -> search results (JSON; in Safe
+                                              Mode a blocked query answers
+                                              { blocked: true, results: [] })
      /api/product/ASIN                      -> product details (JSON: gallery,
                                               bullets, description, detail
                                               table, A+ manufacturer content,
-                                              related items)
+                                              related items; in Safe Mode an
+                                              unsuitable item answers
+                                              { blocked: true })
      /api/browse?type=bestsellers|new|movers&cat=SLUG   -> charts (JSON)
      /img?u=<encoded amazon image URL>      -> image bytes
 
-   Optional hardening:
-     Set ACCESS_KEY below to a secret string. Every request must then
-     include it as the header "x-access-key: <key>" (or ?key=<key>).
-     Enter the same key in the HTML app under Settings.
+   Access control - TWO profiles (edit ACCESS_KEYS below):
+     "unblock" -> full     : normal, unrestricted browsing
+     "safe"    -> filtered : Safe Mode. Searches, results, charts and
+                             product pages containing adult or sexual
+                             content are blocked here in the worker -
+                             the app cannot bypass it. The word list is
+                             BLOCKED_TERMS further down; edit freely.
+     Rename the keys or add your own (value must be "full" or
+     "filtered"). Requests must carry the key as the header
+     "x-access-key" (or ?key=<key>). Leave the map EMPTY {} to
+     disable the gate entirely (anyone with the URL gets full access).
 
    Notes:
      - Amazon sometimes throttles datacenter IPs with a bot-check page.
@@ -41,7 +53,13 @@ const MOBILE_UA =
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
-const ACCESS_KEY = ''; // '' = open to anyone who knows the worker URL
+/* Access-key -> profile map. 'full' = unrestricted, 'filtered' = Safe Mode.
+ * Rename keys / add entries as you like; {} disables the gate entirely. */
+const ACCESS_KEYS = {
+  unblock: 'full',
+  safe: 'filtered',
+};
+
 const FETCH_TIMEOUT_MS = 20000;
 
 const TTL = { search: 600, product: 3600, browse: 900 }; // seconds
@@ -69,6 +87,160 @@ class BlockedError extends Error {}
 class NotFoundError extends Error {}
 
 /* ================================================================== */
+/* Access profiles                                                     */
+/* ================================================================== */
+
+function getAccessProfile(key) {
+  if (!Object.keys(ACCESS_KEYS).length) return 'full'; // gate disabled
+  const k = String(key == null ? '' : key).trim();
+  if (!Object.prototype.hasOwnProperty.call(ACCESS_KEYS, k)) return null;
+  return ACCESS_KEYS[k] === 'filtered' ? 'filtered' : 'full';
+}
+
+/* ================================================================== */
+/* Safe Mode content filter                                            */
+/*                                                                     */
+/* Active for requests whose key maps to the 'filtered' profile.       */
+/* Matching is:                                                        */
+/*   - whole words, plurals included via light stemming                */
+/*       ("bra" catches "bras" but NOT "bracelet" / "library")         */
+/*   - multi-word phrases ("g string", "mini skirt")                    */
+/*   - prefixes, written with a trailing * ("porn*" -> porno, ...)      */
+/*                                                                     */
+/* The list intentionally OVER-blocks - "no way to see anything         */
+/* whatsoever inappropriate" was the brief. That means "adult" also     */
+/* hides adult coloring books, "girl" hides girls' toys, "butt" hides   */
+/* diaper cream, "teen" hides teen novels. Every entry is one line in   */
+/* the array: delete anything you decide is harmless.                  */
+/* ================================================================== */
+
+const BLOCKED_TERMS = [
+  /* adult / explicit */
+  'adult', 'ahegao', 'anal', 'anus', 'areola', 'arse', 'ass', 'bdsm', 'bimbo',
+  'bodystocking', 'bondage', 'boob', 'boobies', 'boobs', 'booty', 'boudoir', 'burlesque',
+  'cialis', 'cleavage', 'cock', 'condom', 'crotch', 'crotchless', 'cupless',
+  'dildo', 'dominatrix', 'ecchi', 'erotic*', 'fetish', 'fleshlight', 'genital',
+  'handcuff', 'hant*', 'hardcore', 'hena*', 'hent*', 'horny', 'hustler', 'kegel', 'kink',
+  'kinky', 'lap dance', 'libido', 'love doll', 'lovedoll', 'lube', 'lubricant',
+  'masturb*', 'milf', 'naughty', 'naked', 'nipple', 'nsfw', 'nude', 'nudes',
+  'onlyfans', 'onahole', 'orgasm', 'penis', 'penthouse', 'playboy', 'porn*',
+  'prostitut*', 'racy', 'risque', 'seductive', 'sensual', 'sex', 'sexual',
+  'sexy', 'sexting', 'sextoy', 'sextoys', 'slut', 'smut', 'striptease',
+  'stroker', 'submissive', 'threesome', 'tit', 'tits', 'titty', 'topless',
+  'twerk', 'vagina', 'vibrator', 'viagra', 'whore', 'xrated', 'xxx', 'yaoi',
+  'yuri',
+
+  /* underwear / lingerie / swimwear */
+  'bakini', 'bandeau', 'bathing suit', 'bikini', 'boyshort', 'bra', 'bralette',
+  'brassiere', 'briefs', 'bustier', 'cami', 'camisole', 'chemise', 'corset',
+  'fishnet', 'g string', 'garter', 'gstring', 'hosiery', 'intimate',
+  'intimates', 'knicker', 'lingerie', 'monokini', 'negligee', 'nightgown',
+  'nightie', 'nightwear', 'panties', 'panty', 'pantyhose', 'peignoir',
+  'shapewear', 'swim brief', 'swim suit', 'swim trunk', 'swimsuit', 'swimwear',
+  'tanga', 'thigh high', 'thighhigh', 'thong', 'underwear',
+
+  /* sleepwear / loungewear */
+  'babydoll', 'loungewear', 'pajama', 'pyjama', 'sleepwear',
+
+  /* revealing clothing */
+  'bodycon', 'butt', 'butt lifter', 'butt lift', 'cheeky', 'crop top',
+  'daisy duke', 'deep v', 'halter top', 'halterneck', 'hot pant', 'legging',
+  'low cut', 'micro mini', 'micro skirt', 'mini skirt', 'off shoulder',
+  'sarong', 'short short', 'stiletto', 'tube top', 'waist trainer',
+  'yoga pant',
+
+  /* people / gendered terms (requested: block "women" and similar) */
+  'female', 'feminine', 'girl', 'girlie', 'girly', 'ladies', 'lady', 'missy',
+  'teen', 'teenage', 'teens', 'woman', 'women',
+
+  /* suggestive phrasing / dance */
+  'ball gag', 'dance pole', 'flirty', 'pole dance', 'pole dancing',
+  'school girl', 'see thru', 'see through', 'sideboob', 'stripper pole',
+  'underboob',
+];
+
+/* Amazon search departments (the i= parameter) blocked in Safe Mode */
+const BLOCKED_DEPTS = ['apparel', 'fashion', 'novelty', 'lingerie', 'intimates', 'sexual-wellness'];
+
+function normText(s) {
+  return String(s == null ? '' : s)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function stemWord(w) {
+  if (w.length > 4 && w.endsWith('ies')) return w.slice(0, -3) + 'y';
+  if (w.length > 4 && /(sses|shes|ches|xes)$/.test(w)) return w.slice(0, -2);
+  if (w.length > 3 && w.endsWith('s') && !w.endsWith('ss')) return w.slice(0, -1);
+  return w;
+}
+
+const SAFE_WORDS = new Set();
+const SAFE_PHRASES = [];
+const SAFE_PREFIXES = [];
+for (const term of BLOCKED_TERMS) {
+  const raw = String(term).trim().toLowerCase();
+  if (!raw) continue;
+  if (raw.endsWith('*')) {
+    const p = raw.slice(0, -1);
+    if (/^[a-z]+$/.test(p)) SAFE_PREFIXES.push(p);
+    continue;
+  }
+  const t = normText(raw);
+  if (!t) continue;
+  if (t.indexOf(' ') >= 0) SAFE_PHRASES.push(t.split(' ').map(stemWord).join(' '));
+  else SAFE_WORDS.add(stemWord(t));
+}
+
+/* Returns the matched (stemmed) term, or null when the text is allowed. */
+function findBlockedTerm(text) {
+  const t = normText(text);
+  if (!t) return null;
+  const words = t.split(' ');
+  for (const w of words) {
+    const sw = stemWord(w);
+    if (SAFE_WORDS.has(sw)) return sw;
+    for (const p of SAFE_PREFIXES) {
+      if (w.startsWith(p)) return p;
+    }
+  }
+  const flat = ' ' + words.map(stemWord).join(' ') + ' ';
+  for (const ph of SAFE_PHRASES) {
+    if (flat.indexOf(' ' + ph + ' ') >= 0) return ph;
+  }
+  return null;
+}
+
+function tileBlocked(t) {
+  return !!findBlockedTerm(t && t.title ? t.title : '');
+}
+
+function productBlocked(p) {
+  const text = [
+    p.title || '',
+    p.brand || '',
+    (p.crumbs || []).join(' '),
+    (p.bullets || []).join(' '),
+  ].join(' ');
+  return !!findBlockedTerm(text);
+}
+
+function sanitizeProduct(p, related) {
+  return {
+    ...p,
+    description: (p.description || []).filter((x) => !findBlockedTerm(x)),
+    details: (p.details || []).filter((kv) => !findBlockedTerm(kv[0] + ' ' + kv[1])),
+    aplus: {
+      images: (p.aplus && p.aplus.images) || [],
+      text: ((p.aplus && p.aplus.text) || []).filter((x) => !findBlockedTerm(x)),
+    },
+    related: (related || []).filter((t) => !tileBlocked(t)),
+  };
+}
+
+/* ================================================================== */
 /* Router                                                              */
 /* ================================================================== */
 
@@ -83,25 +255,25 @@ export default {
 
     const url = new URL(request.url);
 
-    if (ACCESS_KEY) {
-      const k = request.headers.get('x-access-key') || url.searchParams.get('key') || '';
-      if (k !== ACCESS_KEY) {
-        return jsonResponse({ error: 'unauthorized', message: 'Bad or missing access key' }, 401);
-      }
+    const profile = getAccessProfile(
+      request.headers.get('x-access-key') || url.searchParams.get('key') || ''
+    );
+    if (!profile) {
+      return jsonResponse({ error: 'unauthorized', message: 'Bad or missing access key' }, 401);
     }
 
     const p = (url.pathname || '/').replace(/\/+$/, '') || '/';
 
     try {
       if (p === '/' || p === '/health') {
-        return jsonResponse({ ok: true, service: 'amazon-relay', ts: Date.now() });
+        return jsonResponse({ ok: true, service: 'amazon-relay', profile, ts: Date.now() });
       }
       if (p === '/img') {
         return await proxyImage(ctx, url.searchParams.get('u') || '');
       }
-      if (p === '/api/search') return await handleSearch(url, ctx);
-      if (p.startsWith('/api/product/')) return await handleProduct(url, ctx);
-      if (p === '/api/browse') return await handleBrowse(url, ctx);
+      if (p === '/api/search') return await handleSearch(url, ctx, profile);
+      if (p.startsWith('/api/product/')) return await handleProduct(url, ctx, profile);
+      if (p === '/api/browse') return await handleBrowse(url, ctx, profile);
 
       return jsonResponse({ error: 'not_found', message: 'Unknown route: ' + p }, 404);
     } catch (e) {
@@ -908,47 +1080,73 @@ function assembleProduct(p) {
 /* Endpoints                                                           */
 /* ================================================================== */
 
-async function handleSearch(url, ctx) {
+async function handleSearch(url, ctx, profile) {
   const q = (url.searchParams.get('q') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
   const i = url.searchParams.get('i') || '';
   const page = Math.min(50, Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1));
   if (!q) return jsonResponse({ error: 'bad_request', message: 'Missing q parameter' }, 400);
 
   const idx = /^[a-z0-9-]{2,32}$/.test(i) ? i : '';
+
+  if (profile === 'filtered') {
+    if (findBlockedTerm(q)) {
+      return jsonResponse(
+        { q, i: idx, page, blocked: true, results: [], hasMore: false, message: 'This search is blocked in Safe Mode.' },
+        200
+      );
+    }
+    if (idx && BLOCKED_DEPTS.indexOf(idx) >= 0) {
+      return jsonResponse(
+        { q, i: idx, page, blocked: true, results: [], hasMore: false, message: 'This category is blocked in Safe Mode.' },
+        200
+      );
+    }
+  }
+
   const target = '/s?k=' + encodeURIComponent(q) + (idx ? '&i=' + idx : '') + '&page=' + page;
 
-  return cachedJson(ctx, 'search|' + q.toLowerCase() + '|' + idx + '|' + page, TTL.search, async () => {
+  return cachedJson(ctx, 'search|' + profile + '|' + q.toLowerCase() + '|' + idx + '|' + page, TTL.search, async () => {
     const html = await getAmazonHTML(target);
     const { tiles } = await runExtractor(html, 'search', null);
-    return { q, i: idx, page, results: tiles, hasMore: tiles.length > 0 };
+    const results = profile === 'filtered' ? tiles.filter((t) => !tileBlocked(t)) : tiles;
+    /* hasMore follows the RAW tile count so a page whose items were all
+     * filtered out can still paginate to the next page */
+    return { q, i: idx, page, results, hasMore: tiles.length > 0 };
   });
 }
 
-async function handleProduct(url, ctx) {
+async function handleProduct(url, ctx, profile) {
   const m = url.pathname.match(/^\/api\/product\/([A-Z0-9]{10})$/i);
   if (!m) return jsonResponse({ error: 'bad_request', message: 'Bad ASIN' }, 400);
   const asin = m[1].toUpperCase();
 
-  return cachedJson(ctx, 'product|' + asin, TTL.product, async () => {
+  return cachedJson(ctx, 'product|' + profile + '|' + asin, TTL.product, async () => {
     const html = await getAmazonHTML('/dp/' + asin);
     const { product, related } = await runExtractor(html, 'product', asin);
     if (!product.title && !product.images.length && !related.length) {
       throw new NotFoundError('Product not found or page not parseable');
     }
+    if (profile === 'filtered') {
+      if (productBlocked(product)) {
+        return { asin, blocked: true, message: 'This item is blocked in Safe Mode.' };
+      }
+      return sanitizeProduct(product, related);
+    }
     return { ...product, related };
   });
 }
 
-async function handleBrowse(url, ctx) {
+async function handleBrowse(url, ctx, profile) {
   const typeRaw = url.searchParams.get('type') || 'bestsellers';
   const type = BROWSE_TYPES[typeRaw] || 'bestsellers';
   const cat = (url.searchParams.get('cat') || '').toLowerCase();
   const catOk = /^[a-z0-9-]{2,40}$/.test(cat) ? cat : '';
   const target = '/gp/' + type + (catOk ? '/' + catOk : '');
 
-  return cachedJson(ctx, 'browse|' + type + '|' + catOk, TTL.browse, async () => {
+  return cachedJson(ctx, 'browse|' + profile + '|' + type + '|' + catOk, TTL.browse, async () => {
     const html = await getAmazonHTML(target);
     const { tiles } = await runExtractor(html, 'browse', null);
-    return { type, cat: catOk, items: tiles };
+    const items = profile === 'filtered' ? tiles.filter((t) => !tileBlocked(t)) : tiles;
+    return { type, cat: catOk, items };
   });
 }
