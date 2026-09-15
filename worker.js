@@ -31,7 +31,7 @@
                                    pages - each with the reason)
      POST /admin/stats/reset    -> clear the log
      Both need the admin password (ADMIN_PASSWORD below) as the header
-     "adminkey" (or ?adminKey=). Pair this with amazon-admin.html - a
+     "x-admin-key" (or ?adminKey=). Pair this with amazon-admin.html - a
      single-file dashboard that asks for the password and shows the log.
      Storage: in worker memory by default (kept while the worker stays
      warm; cleared by a redeploy or an idle restart). For permanent
