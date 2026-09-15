@@ -31,16 +31,25 @@
                              content are blocked here in the worker -
                              the app cannot bypass it. The word list is
                              BLOCKED_TERMS further down; edit freely.
+                             Generic words (underwear, pajamas, swimsuit,
+                             ...) are NOT blocked: searching "underwear"
+                             still works, men's and kids' items show, and
+                             women's items are discarded because their
+                             titles say "Women's" / "Ladies" / "Girls".
      Rename the keys or add your own (value must be "full" or
      "filtered"). Requests must carry the key as the header
      "x-access-key" (or ?key=<key>). Leave the map EMPTY {} to
      disable the gate entirely (anyone with the URL gets full access).
 
    Notes:
-     - Amazon sometimes throttles datacenter IPs with a bot-check page.
-       The worker retries automatically with a different browser
-       profile; if it is still blocked it returns { "error": "blocked" }
-       and the app shows a Retry button. Waiting a few seconds works.
+     - Amazon throttles datacenter IPs with bot-check pages: a 503
+       captcha page, or a ~2 KB Akamai challenge shell (bm-verify) that
+       returns HTTP 200 and contains no products. The worker detects
+       both, retries up to five times with browser-profile rotation,
+       session cookies and a homepage warm-up between attempts, and
+       only then returns { "error": "blocked" } - the app shows a
+       Retry button. A page that cannot be read NEVER comes back as
+       an empty "no results" answer.
      - Responses are cached at the Cloudflare edge (search 10 min,
        product 1 h, charts 15 min) to make repeat browsing instant and
        to reduce the chance of hitting the bot check.
@@ -77,6 +86,14 @@ const BLOCK_MARKERS = [
   'To discuss automated access',
 ];
 
+/* Akamai interstitial challenge shell (HTTP 200/202, ~2 KB, no products).
+ * If this slips through, searches silently return zero results. */
+const SHELL_MARKERS = ['bm-verify', '/_sec/verify', 'triggerInterstitial'];
+
+/* Amazon's genuine "we found nothing" wording. A zero-tile page WITHOUT
+ * any of these phrases was not a real search answer - it was a wall. */
+const EMPTY_SEARCH_RE = /did not match any products|no results (?:were found )?for/i;
+
 const BROWSE_TYPES = {
   bestsellers: 'bestsellers',
   new: 'new-releases',
@@ -103,7 +120,7 @@ function getAccessProfile(key) {
 /* Active for requests whose key maps to the 'filtered' profile.       */
 /* Matching is:                                                        */
 /*   - whole words, plurals included via light stemming                */
-/*       ("bra" catches "bras" but NOT "bracelet" / "library")         */
+/*       ("bra" catches "bras" but NOT "bracelet" / "library")          */
 /*   - multi-word phrases ("g string", "mini skirt")                    */
 /*   - prefixes, written with a trailing * ("porn*" -> porno, ...)      */
 /*                                                                     */
@@ -112,10 +129,18 @@ function getAccessProfile(key) {
 /* hides adult coloring books, "girl" hides girls' toys, "butt" hides   */
 /* diaper cream, "teen" hides teen novels. Every entry is one line in   */
 /* the array: delete anything you decide is harmless.                  */
+/*                                                                     */
+/* EXCEPTION (user-requested): generic garment words - underwear,       */
+/* briefs, pajamas, nightgown, swimsuit, swim trunks, sleepwear,        */
+/* loungewear - are deliberately NOT listed. Searching "underwear"      */
+/* still works: men's and kids' items show, while the women's items     */
+/* in those results are discarded anyway because their titles carry    */
+/* the gendered words (women's, ladies, girls, ...). Only styles that   */
+/* are inherently women's-and-intimate (bra, bikini, lingerie,         */
+/* thong, ...) are listed directly.                                    */
 /* ================================================================== */
 
 const BLOCKED_TERMS = [
-  /* adult / explicit */
   'adult', 'ahegao', 'anal', 'anus', 'areola', 'arse', 'ass', 'bdsm', 'bimbo',
   'bodystocking', 'bondage', 'boob', 'boobies', 'boobs', 'booty', 'boudoir', 'burlesque',
   'cialis', 'cleavage', 'cock', 'condom', 'crotch', 'crotchless', 'cupless',
@@ -130,30 +155,24 @@ const BLOCKED_TERMS = [
   'twerk', 'vagina', 'vibrator', 'viagra', 'whore', 'xrated', 'xxx', 'yaoi',
   'yuri',
 
-  /* underwear / lingerie / swimwear */
-  'bakini', 'bandeau', 'bathing suit', 'bikini', 'boyshort', 'bra', 'bralette',
-  'brassiere', 'briefs', 'bustier', 'cami', 'camisole', 'chemise', 'corset',
-  'fishnet', 'g string', 'garter', 'gstring', 'hosiery', 'intimate',
-  'intimates', 'knicker', 'lingerie', 'monokini', 'negligee', 'nightgown',
-  'nightie', 'nightwear', 'panties', 'panty', 'pantyhose', 'peignoir',
-  'shapewear', 'swim brief', 'swim suit', 'swim trunk', 'swimsuit', 'swimwear',
-  'tanga', 'thigh high', 'thighhigh', 'thong', 'underwear',
+  'bakini', 'bandeau', 'bikini', 'bra', 'bralette', 'brassiere', 'bustier',
+  'cami', 'camisole', 'chemise', 'corset', 'fishnet', 'g string', 'garter',
+  'gstring', 'hosiery', 'intimate', 'intimates', 'jegging', 'knicker',
+  'lingerie', 'microkini', 'monokini', 'negligee', 'panties', 'panty',
+  'pantyhose', 'peignoir', 'shapewear', 'tanga', 'tankini', 'thigh high',
+  'thighhigh', 'thong',
 
-  /* sleepwear / loungewear */
-  'babydoll', 'loungewear', 'pajama', 'pyjama', 'sleepwear',
+  'babydoll',
 
-  /* revealing clothing */
   'bodycon', 'butt', 'butt lifter', 'butt lift', 'cheeky', 'crop top',
   'daisy duke', 'deep v', 'halter top', 'halterneck', 'hot pant', 'legging',
   'low cut', 'micro mini', 'micro skirt', 'mini skirt', 'off shoulder',
   'sarong', 'short short', 'stiletto', 'tube top', 'waist trainer',
   'yoga pant',
 
-  /* people / gendered terms (requested: block "women" and similar) */
   'female', 'feminine', 'girl', 'girlie', 'girly', 'ladies', 'lady', 'missy',
   'teen', 'teenage', 'teens', 'woman', 'women',
 
-  /* suggestive phrasing / dance */
   'ball gag', 'dance pole', 'flirty', 'pole dance', 'pole dancing',
   'school girl', 'see thru', 'see through', 'sideboob', 'stripper pole',
   'underboob',
@@ -326,42 +345,94 @@ function attr(el, name) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ================================================================== */
-/* Fetch layer (with bot-check detection + UA rotation)                */
+/* Fetch layer (bot-check detection + UA rotation + session cookies)  */
 /* ================================================================== */
+
+/* Amazon edge session cookies (anonymous session-id / ubid / i18n
+ * prefs). Harvested from every Amazon response, kept per isolate,
+ * replayed on later fetches, and refreshed by the homepage warm-up.
+ * Live-tested to raise the pass rate against the bot wall a lot. */
+let cookieState = { cookies: '', ts: 0 };
+const COOKIE_TTL_MS = 30 * 60 * 1000;
+
+function harvestCookies(res) {
+  let raw = [];
+  try {
+    if (typeof res.headers.getAll === 'function') raw = res.headers.getAll('set-cookie');
+  } catch (e) {}
+  if (!raw || !raw.length) {
+    try {
+      if (typeof res.headers.getSetCookie === 'function') raw = res.headers.getSetCookie();
+    } catch (e) {}
+  }
+  if (!raw || !raw.length) {
+    const single = res.headers.get('set-cookie');
+    if (single) raw = [single];
+  }
+  const pairs = {};
+  for (const line of raw) {
+    const m = /^\s*([^=;\s]+=[^;]*)/.exec(String(line));
+    if (m) pairs[m[1].split('=')[0].trim()] = m[1];
+  }
+  const keys = Object.keys(pairs);
+  if (keys.length) {
+    cookieState.cookies = keys.map((k) => pairs[k]).join('; ');
+    cookieState.ts = Date.now();
+  }
+}
 
 async function fetchAmazon(target, ua) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
   try {
-    return await fetch(AMAZON + target, {
+    const jarFresh = cookieState.cookies && Date.now() - cookieState.ts < COOKIE_TTL_MS;
+    const res = await fetch(AMAZON + target, {
       headers: {
         'user-agent': ua,
         accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'accept-language': 'en-US,en;q=0.9',
         referer: AMAZON + '/',
         'upgrade-insecure-requests': '1',
+        ...(jarFresh ? { cookie: cookieState.cookies } : {}),
       },
       redirect: 'follow',
       signal: ctrl.signal,
     });
+    harvestCookies(res);
+    return res;
   } finally {
     clearTimeout(timer);
   }
 }
 
+/* Touching the homepage before a retry measurably raises the pass rate
+ * of the request that follows (live-tested against the wall). It also
+ * refreshes the cookie jar when Amazon answers with a real page. */
+async function touchAmazonHome(ua) {
+  try {
+    const res = await fetchAmazon('/', ua);
+    await res.text(); // drain
+  } catch (e) {}
+}
+
 async function getAmazonHTML(target) {
   /* Desktop profile first: live-verified to expose the richest markup
-   * (full image gallery, breadcrumbs, review counts) and to pass the
-   * bot check more often from datacenter IPs. Mobile is the fallback. */
-  const attempts = [DESKTOP_UA, MOBILE_UA];
+   * (full image gallery, breadcrumbs, review counts). Mobile mixed in
+   * as a fallback. Amazon fronts datacenter traffic with (a) a 503
+   * captcha page, (b) a 202/200 Akamai challenge shell of ~2 KB with
+   * no products, or (c) occasionally a real page. Retry with profile
+   * rotation + homepage warm-ups until a real page comes through. */
+  const attempts = [DESKTOP_UA, DESKTOP_UA, MOBILE_UA, DESKTOP_UA, MOBILE_UA];
   let saw404 = false;
 
-  for (const ua of attempts) {
+  for (let i = 0; i < attempts.length; i++) {
+    if (i > 0) await touchAmazonHome(attempts[i]);
+
     let res;
     try {
-      res = await fetchAmazon(target, ua);
+      res = await fetchAmazon(target, attempts[i]);
     } catch (e) {
-      await sleep(200);
+      await sleep(300);
       continue; // timeout / network hiccup -> try next profile
     }
 
@@ -373,6 +444,7 @@ async function getAmazonHTML(target) {
     const finalUrl = res.url || '';
     let hardBlocked =
       res.status === 503 ||
+      res.status === 202 ||
       finalUrl.includes('/errors/') ||
       finalUrl.includes('validate_captcha') ||
       !(res.headers.get('content-type') || '').includes('text/html');
@@ -384,11 +456,24 @@ async function getAmazonHTML(target) {
       hardBlocked = true;
     }
 
-    if (!hardBlocked && !BLOCK_MARKERS.some((m) => html.includes(m))) {
+    /* challenge shells are tiny and contain no product tiles and no
+     * "no results" wording; a real search/product/chart page is 100 KB+ */
+    const tinyShell =
+      html.length > 0 && html.length < 8192 && !/data-asin=|no results for|did not match/i.test(html);
+
+    if (
+      !hardBlocked &&
+      !tinyShell &&
+      !BLOCK_MARKERS.some((m) => html.includes(m)) &&
+      !SHELL_MARKERS.some((m) => html.includes(m))
+    ) {
       return html;
     }
 
-    await sleep(250 + Math.floor(Math.random() * 450));
+    /* the wall won: drop the cookies so the warm-up re-harvests fresh */
+    cookieState.cookies = '';
+
+    await sleep(350 + Math.floor(Math.random() * 750));
   }
 
   if (saw404) throw new NotFoundError('Amazon returned 404');
@@ -513,6 +598,29 @@ async function proxyImage(ctx, raw) {
 
 const IMG_PATH_RE = /\/images\/I\//;
 
+/* Amazon pages carry 0.5-1 MB of inline JavaScript. That JS (a) slows
+ * the rewriter down and (b) used to LEAK into collected text - metrics
+ * scripts like P.when('A','ready').execute(...) were showing up as
+ * product description / detail rows. Drop script/style/noscript bodies
+ * and HTML comments before parsing; nothing the extractors read lives
+ * there (all data comes from real elements and attributes). */
+function stripInert(html) {
+  return String(html)
+    .replace(/<script\b[^>]*>[\s\S]*?(?:<\/script\s*>|$)/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?(?:<\/style\s*>|$)/gi, ' ')
+    .replace(/<noscript\b[^>]*>[\s\S]*?(?:<\/noscript\s*>|$)/gi, ' ')
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, ' ');
+}
+
+/* belt and suspenders: any text chunk that still looks like inline JS
+ * is dropped by every collector */
+const CODE_JUNK_RE =
+  /P\.when\s*\(|A\.declarative\s*\(|dp[A-Z][A-Za-z]*Click|triggerInterstitial|bm-verify|XMLHttpRequest|\.execute\s*\(\s*function/;
+
+function looksLikeCode(t) {
+  return CODE_JUNK_RE.test(t);
+}
+
 function fullSize(u) {
   // "https://.../I/41kN1._AC_US40_.jpg" -> "https://.../I/41kN1.jpg"
   return String(u).replace(/\._[^./?]+(?=\.(?:jpg|jpeg|png|webp|gif))/i, '');
@@ -539,7 +647,8 @@ function priceNum(s) {
   return m ? parseFloat(m[1]) : NaN;
 }
 
-async function runExtractor(html, mode, asin) {
+async function runExtractor(rawHtml, mode, asin) {
+  const html = stripInert(rawHtml);
   const tiles = [];
   let cur = null;
   const flushers = [];
@@ -569,7 +678,7 @@ async function runExtractor(html, mode, asin) {
       flush() {
         const v = buf.replace(/\s+/g, ' ').trim();
         buf = '';
-        if (v && onText) onText(v, tgt);
+        if (v && !looksLikeCode(v) && onText) onText(v, tgt);
       },
     };
     flushers.push(h);
@@ -748,6 +857,7 @@ async function runExtractor(html, mode, asin) {
       pricePool: [],
       struckPool: [],
       buyboxPrice: '',
+      aodPrice: '',
       rating: null,
       reviews: '',
       availability: '',
@@ -898,6 +1008,13 @@ async function runExtractor(html, mode, asin) {
       if (product.aplusParas.length < 16 && t.length > 3) product.aplusParas.push(t.slice(0, 1200));
     }, pc);
 
+    /* "New & Used (37) from $199.49" - some page variants leave the
+     * corePrice buybox empty (JS-rendered) and only this static offers
+     * block carries a price; it is a labeled last-resort fallback. */
+    const aodP = makeCollector((t) => {
+      if (!product.aodPrice) product.aodPrice = t;
+    }, pc);
+
     rw = rw
       .on('meta[property="og:title"]', metaOg('ogTitle'))
       .on('meta[property="og:image"]', metaOg('ogImage'))
@@ -918,6 +1035,7 @@ async function runExtractor(html, mode, asin) {
       .on('#price_inside_buybox', buyboxP)
       .on('#priceblock_ourprice', buyboxP)
       .on('#priceblock_dealprice', buyboxP)
+      .on('#dynamic-aod-ingress-box span.a-price .a-offscreen', aodP)
       .on('#acrPopover .a-icon-alt', ratingP)
       .on('#averageCustomerReviews .a-icon-alt', ratingP)
       .on('#acrCustomerReviewLink .a-icon-alt', ratingP)
@@ -1027,6 +1145,8 @@ function assembleProduct(p) {
 
   const nonStruck = p.pricePool.filter((x) => !p.struckPool.includes(x));
   let price = poolMode(nonStruck) || p.struckPool[0] || p.buyboxPrice || null;
+  /* JS-rendered buybox variant: fall back to the static offers price */
+  if (!price && p.aodPrice && /^\$\d/.test(p.aodPrice)) price = 'from ' + p.aodPrice;
   let listPrice = p.struckPool.find((x) => x !== price) || null;
   if (price && listPrice && !(priceNum(listPrice) > priceNum(price))) listPrice = null;
 
@@ -1058,10 +1178,22 @@ function assembleProduct(p) {
   }
   const aplus = { images: aplusImages, text: (p.aplusParas || []).slice(0, 14) };
 
+  /* brand fallback: the byline is JS-rendered on some variants, but the
+   * tech-spec table still carries "Brand Name : ..." */
+  let brand = p.brand || '';
+  if (!brand) {
+    for (const kv of details) {
+      if (/^\s*brand(\s+name)?\s*$/i.test(kv[0])) {
+        brand = kv[1].slice(0, 60);
+        break;
+      }
+    }
+  }
+
   return {
     asin: p.asin,
     title: p.title || p.ogTitle || '',
-    brand: p.brand || '',
+    brand,
     price,
     listPrice,
     rating: p.rating,
@@ -1108,6 +1240,12 @@ async function handleSearch(url, ctx, profile) {
   return cachedJson(ctx, 'search|' + profile + '|' + q.toLowerCase() + '|' + idx + '|' + page, TTL.search, async () => {
     const html = await getAmazonHTML(target);
     const { tiles } = await runExtractor(html, 'search', null);
+    /* A page the relay could not read must NEVER look like "no results":
+     * only Amazon's genuine empty page is an empty answer. Anything
+     * else zero-tile was a bot wall we did not recognize - say so. */
+    if (!tiles.length && !EMPTY_SEARCH_RE.test(html)) {
+      throw new BlockedError('Search page was not readable');
+    }
     const results = profile === 'filtered' ? tiles.filter((t) => !tileBlocked(t)) : tiles;
     /* hasMore follows the RAW tile count so a page whose items were all
      * filtered out can still paginate to the next page */
@@ -1146,6 +1284,8 @@ async function handleBrowse(url, ctx, profile) {
   return cachedJson(ctx, 'browse|' + profile + '|' + type + '|' + catOk, TTL.browse, async () => {
     const html = await getAmazonHTML(target);
     const { tiles } = await runExtractor(html, 'browse', null);
+    /* charts always contain tiles; zero means we were walled */
+    if (!tiles.length) throw new BlockedError('Chart page was not readable');
     const items = profile === 'filtered' ? tiles.filter((t) => !tileBlocked(t)) : tiles;
     return { type, cat: catOk, items };
   });
