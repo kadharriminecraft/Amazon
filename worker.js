@@ -12,7 +12,10 @@
    Endpoints (all GET, CORS: *):
      /health                                -> { ok: true }
      /api/search?q=...&page=N&i=INDEX       -> search results (JSON)
-     /api/product/ASIN                      -> product details (JSON)
+     /api/product/ASIN                      -> product details (JSON: gallery,
+                                              bullets, description, detail
+                                              table, A+ manufacturer content,
+                                              related items)
      /api/browse?type=bestsellers|new|movers&cat=SLUG   -> charts (JSON)
      /img?u=<encoded amazon image URL>      -> image bytes
 
@@ -577,6 +580,11 @@ async function runExtractor(html, mode, asin) {
       reviews: '',
       availability: '',
       bullets: [],
+      descParas: [],
+      detailPairs: [],
+      aplusImgs: [],
+      aplusParas: [],
+      _dk: null,
       mainImg: '',
       mainImgCandidates: [],
       thumbSrcs: [],
@@ -664,13 +672,59 @@ async function runExtractor(html, mode, asin) {
 
     const imgThumb = {
       element(el) {
-        if (product.thumbSrcs.length >= 24) return;
-        const s = attr(el, 'src') || attr(el, 'data-src') || '';
+        if (product.thumbSrcs.length >= 30) return;
+        const s = attr(el, 'data-old-hires') || attr(el, 'data-a-hires') || attr(el, 'src') || attr(el, 'data-src') || '';
         if (!/^https:\/\//.test(s) || !IMG_PATH_RE.test(s)) return;
         if (/play|video|sprite|transparent|placeholder/i.test(s + ' ' + (attr(el, 'alt') || ''))) return;
         product.thumbSrcs.push(s);
       },
     };
+
+    /* --- "Product description" paragraphs --- */
+    const descP = makeCollector((t) => {
+      if (product.descParas.length < 20 && t.length > 2) product.descParas.push(t.slice(0, 2000));
+    }, pc);
+
+    /* --- "Product details" / tech-spec tables: th + td pair up row by row.
+     * Separate buffers: a td's text flushes when the next th opens, by which
+     * time that th's text has already flushed and stored its key. --- */
+    const detailTh = makeCollector((t) => {
+      const k = t.replace(/[\u200e\u200f]/g, '').replace(/\s+/g, ' ').trim();
+      if (k && k.length <= 80) product._dk = k;
+    }, pc);
+    const detailTd = makeCollector((t) => {
+      const k = product._dk;
+      product._dk = null;
+      if (!k || product.detailPairs.length >= 30) return;
+      const v = t.replace(/[\u200e\u200f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 250);
+      if (v) product.detailPairs.push([k, v]);
+    }, pc);
+
+    /* --- detail bullets ("ASIN : B0...", "Best Sellers Rank: #1 in...") --- */
+    const detailLi = makeCollector((t) => {
+      if (product.detailPairs.length >= 30) return;
+      const s = t.replace(/[\u200e\u200f]/g, '').replace(/\s+/g, ' ').trim();
+      const c = s.indexOf(':');
+      if (c < 2 || c > 60) return;
+      const k = s.slice(0, c).trim();
+      const v = s.slice(c + 1).trim().slice(0, 250);
+      if (k && v) product.detailPairs.push([k, v]);
+    }, pc);
+
+    /* --- A+ "From the manufacturer" images + text --- */
+    const aplusImg = {
+      element(el) {
+        if (product.aplusImgs.length >= 12) return;
+        const cands = [attr(el, 'data-old-hires'), attr(el, 'data-a-hi-res'), attr(el, 'data-src'), attr(el, 'src')];
+        const u = cands.find(
+          (x) => x && /^https:\/\//.test(x) && IMG_PATH_RE.test(x) && !/sprite|spacer|transparent|icon|1x1|play|video|logo/i.test(x)
+        );
+        if (u) product.aplusImgs.push(u);
+      },
+    };
+    const aplusP = makeCollector((t) => {
+      if (product.aplusParas.length < 16 && t.length > 3) product.aplusParas.push(t.slice(0, 1200));
+    }, pc);
 
     rw = rw
       .on('meta[property="og:title"]', metaOg('ogTitle'))
@@ -715,7 +769,19 @@ async function runExtractor(html, mode, asin) {
       .on('#altImages img', imgThumb)
       .on('#wayfinding-breadcrumbs_feature_div a', makeCollector((t) => {
         if (product.crumbs.length < 6 && t.length > 1 && !/^back to results$/i.test(t)) product.crumbs.push(t.slice(0, 40));
-      }, pc));
+      }, pc))
+      .on('#productDescription p', descP)
+      .on('#prodDetails th', detailTh)
+      .on('#prodDetails td', detailTd)
+      .on('table[id^="productDetails_techSpec"] th', detailTh)
+      .on('table[id^="productDetails_techSpec"] td', detailTd)
+      .on('table[id^="productDetails_detailBullets"] th', detailTh)
+      .on('table[id^="productDetails_detailBullets"] td', detailTd)
+      .on('#detailBullets_feature_div li', detailLi)
+      .on('#aplus img', aplusImg)
+      .on('#aplus_feature_div img', aplusImg)
+      .on('#aplus p', aplusP)
+      .on('#aplus_feature_div p', aplusP);
   }
 
   /* --- run the pipeline --- */
@@ -774,16 +840,17 @@ function assembleProduct(p) {
     return m ? m[1] : null;
   };
   const add = (u) => {
-    if (!u || images.length >= 8) return;
-    const id = imgId(fullSize(u));
+    if (!u || images.length >= 12) return;
+    const big = fullSize(u);
+    const id = imgId(big);
     if (!id || seenIds.has(id)) return;
     seenIds.add(id);
-    images.push(u);
+    images.push(big);
   };
 
   if (p.mainImgCandidates.length) add(p.mainImgCandidates[0]);
   add(p.mainImg);
-  for (const t of p.thumbSrcs) add(fullSize(t));
+  for (const t of p.thumbSrcs) add(t);
   if (!images.length && p.ogImage) add(p.ogImage);
 
   const nonStruck = p.pricePool.filter((x) => !p.struckPool.includes(x));
@@ -792,6 +859,32 @@ function assembleProduct(p) {
   if (price && listPrice && !(priceNum(listPrice) > priceNum(price))) listPrice = null;
 
   const bullets = p.bullets.length ? p.bullets : p.ogDesc ? [p.ogDesc] : [];
+
+  /* --- detail key/value pairs (tables + bullet lists), deduped by key --- */
+  const details = [];
+  const seenKeys = new Set();
+  for (const pair of p.detailPairs) {
+    const k = String(pair[0] || '').replace(/[\u200e\u200f]/g, '').replace(/\s+/g, ' ').trim();
+    const v = String(pair[1] || '').replace(/[\u200e\u200f]/g, '').replace(/\s+/g, ' ').trim();
+    if (!k || !v) continue;
+    const kl = k.toLowerCase();
+    if (seenKeys.has(kl)) continue;
+    seenKeys.add(kl);
+    details.push([k.slice(0, 60), v.slice(0, 250)]);
+  }
+
+  /* --- A+ "from the manufacturer": deduped images + text --- */
+  const aplusImgIds = new Set();
+  const aplusImages = [];
+  for (const u of p.aplusImgs) {
+    if (aplusImages.length >= 10) break;
+    const big = fullSize(u);
+    const id = imgId(big);
+    if (!id || aplusImgIds.has(id)) continue;
+    aplusImgIds.add(id);
+    aplusImages.push(big);
+  }
+  const aplus = { images: aplusImages, text: (p.aplusParas || []).slice(0, 14) };
 
   return {
     asin: p.asin,
@@ -804,6 +897,9 @@ function assembleProduct(p) {
     availability: p.availability || '',
     images,
     bullets,
+    description: p.descParas.slice(0, 20),
+    details,
+    aplus,
     crumbs: p.crumbs,
   };
 }
