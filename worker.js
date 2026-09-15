@@ -36,6 +36,9 @@
                              still works, men's and kids' items show, and
                              women's items are discarded because their
                              titles say "Women's" / "Ladies" / "Girls".
+                             Misspellings do NOT slip through: queries and
+                             text are additionally matched against a
+                             one-edit typo guard (see "typo guard" below).
      Rename the keys or add your own (value must be "full" or
      "filtered"). Requests must carry the key as the header
      "x-access-key" (or ?key=<key>). Leave the map EMPTY {} to
@@ -196,9 +199,99 @@ function stemWord(w) {
   return w;
 }
 
+/* --- typo guard ----------------------------------------------------
+ * A plain word list is sidestepped by misspelling it ("leggingd" was
+ * searched and results leaked through). Beyond exact matching, every
+ * word (after leet-style normalization) is also matched when it is ONE
+ * EDIT away from a blocked stem of length >= 7:
+ *   - one letter inserted or deleted (any letter) -> match
+ *   - two adjacent letters swapped             -> match
+ *   - one letter substituted   -> match only when the two letters sit
+ *     next to each other on a QWERTY keyboard (real typos; "legging"
+ *     -> "kegging" yes, "legging" -> "logging" no)
+ * Real words that happen to sit one edit away are exempted in
+ * NEAR_EXEMPT below so innocent shopping keeps working; short blocked
+ * words are excluded by the length rule: pants (not panty), things
+ * (not thong), woven (not women), brand/bracelet (not bra).            */
+
+const LEET_MAP = { '0': 'o', '1': 'l', '3': 'e', '4': 'a', '5': 's', '7': 't', '8': 'b', '@': 'a', '$': 's' };
+function leetify(w) {
+  return w.replace(/[0134578@$]/g, (c) => LEET_MAP[c] || c);
+}
+/* '1' doubles for both l and i in leetspeak ("l1nger1e" -> "lingerie"):
+ * when a word contains a 1, both readings are tried */
+function leetOne(w, one) {
+  return w.replace(/[0134578@$]/g, (c) => (c === '1' ? one : LEET_MAP[c] || c));
+}
+function leetVariants(w) {
+  if (w.indexOf('1') < 0) return [leetify(w)];
+  const a = leetOne(w, 'l');
+  const b = leetOne(w, 'i');
+  return a === b ? [a] : [a, b];
+}
+
+/* QWERTY neighbor pairs (both orders precomputed below) */
+const QWERTY_ADJ_SRC = {
+  q: 'wa', w: 'qeas', e: 'wrsd', r: 'etdf', t: 'ryfg', y: 'tugh', u: 'yihj', i: 'uojk',
+  o: 'ipkl', p: 'ol', a: 'qwsz', s: 'awedxz', d: 'serfcx', f: 'drtgvc', g: 'ftyhbv',
+  h: 'gyujnb', j: 'huikmn', k: 'jiolm', l: 'kop', z: 'asx', x: 'zsdc', c: 'xdfv',
+  v: 'cfgb', b: 'vghn', n: 'bhjm', m: 'njk',
+};
+const QWERTY_ADJ = new Set();
+for (const k of Object.keys(QWERTY_ADJ_SRC)) {
+  for (const n of QWERTY_ADJ_SRC[k]) {
+    QWERTY_ADJ.add(k + n);
+    QWERTY_ADJ.add(n + k);
+  }
+}
+
+/* is word a one-edit typo of cand? (both already stemmed+leeted) */
+function nearWord(word, cand) {
+  const lw = word.length;
+  const lc = cand.length;
+  if (Math.abs(lw - lc) > 1) return false;
+  if (lw === lc) {
+    const diffs = [];
+    for (let i = 0; i < lw; i++) {
+      if (word[i] !== cand[i]) diffs.push(i);
+      if (diffs.length > 2) return false;
+    }
+    if (diffs.length === 1) {
+      const i = diffs[0];
+      return QWERTY_ADJ.has(word[i] + cand[i]);
+    }
+    if (diffs.length === 2) {
+      const i = diffs[0];
+      const j = diffs[1];
+      return j === i + 1 && word[i] === cand[j] && word[j] === cand[i];
+    }
+    return false;
+  }
+  /* one insertion/deletion */
+  const longer = lw > lc ? word : cand;
+  const shorter = lw > lc ? cand : word;
+  let i = 0;
+  let j = 0;
+  let skipped = false;
+  while (i < longer.length && j < shorter.length) {
+    if (longer[i] === shorter[j]) {
+      i++;
+      j++;
+      continue;
+    }
+    if (skipped) return false;
+    skipped = true;
+    i++;
+  }
+  return true;
+}
+
 const SAFE_WORDS = new Set();
 const SAFE_PHRASES = [];
 const SAFE_PREFIXES = [];
+const SAFE_JOINED = new Set(); /* multi-word terms with spaces removed */
+const FUZZY_WORDS = []; /* blocked stems of length >= 7, for the typo guard */
+const FUZZY_BY_LEN = new Map(); /* length -> [stems] (distance 1 needs +/-1) */
 for (const term of BLOCKED_TERMS) {
   const raw = String(term).trim().toLowerCase();
   if (!raw) continue;
@@ -209,8 +302,74 @@ for (const term of BLOCKED_TERMS) {
   }
   const t = normText(raw);
   if (!t) continue;
-  if (t.indexOf(' ') >= 0) SAFE_PHRASES.push(t.split(' ').map(stemWord).join(' '));
-  else SAFE_WORDS.add(stemWord(t));
+  if (t.indexOf(' ') >= 0) {
+    SAFE_PHRASES.push(t.split(' ').map(stemWord).join(' '));
+    SAFE_JOINED.add(t.replace(/ /g, ''));
+    continue;
+  }
+  const stem = stemWord(t);
+  SAFE_WORDS.add(stem);
+  if (stem.length >= 7 && /^[a-z]+$/.test(stem)) {
+    FUZZY_WORDS.push(stem);
+    if (!FUZZY_BY_LEN.has(stem.length)) FUZZY_BY_LEN.set(stem.length, []);
+    FUZZY_BY_LEN.get(stem.length).push(stem);
+    /* index the plural form too: "leggingsd" is one edit from
+     * "leggings" but two from the stem "legging" */
+    if (!/(s|x|z)$/.test(stem)) {
+      const pl = stem + 's';
+      if (!FUZZY_BY_LEN.has(pl.length)) FUZZY_BY_LEN.set(pl.length, []);
+      FUZZY_BY_LEN.get(pl.length).push(pl);
+    }
+  }
+}
+
+/* Real words that happen to sit one edit from a blocked stem. They are
+ * exempted from the typo guard so ordinary shopping keeps working; if
+ * someone really is hunting that blocked term with this exact spelling,
+ * the exact/prefix/phrase layers and the item-level filter still apply. */
+const NEAR_EXEMPT = new Set([
+  'logging', 'chemist', 'gaiter', 'gaiters', 'condor', 'cortex', 'hardware',
+  'wedding', 'weddings', 'buster', 'vibrato', 'hustle', 'hardcode', 'kicker',
+]);
+
+/* exact + fuzzy check of ONE already-normalized word */
+function wordBlocked(w) {
+  if (SAFE_WORDS.has(w)) return w;
+  for (const lw of leetVariants(w)) {
+    const sw = stemWord(lw);
+    if (SAFE_WORDS.has(sw)) return sw;
+    for (const p of SAFE_PREFIXES) {
+      if (lw.startsWith(p)) return p;
+      if (sw.startsWith(p)) return p;
+    }
+    /* typo guard: one edit away from a long blocked stem. Both the raw
+     * and the stemmed form are compared ("pantyhos" stems to "pantyho",
+     * which is two edits from "pantyhose" - the raw form is one). */
+    if (NEAR_EXEMPT.has(sw) || NEAR_EXEMPT.has(lw)) continue;
+    for (const cand of fuzzyCandidates(lw, sw)) {
+      if (nearWord(lw, cand) || nearWord(sw, cand)) return cand;
+    }
+  }
+  return null;
+}
+
+/* length-bucketed fuzzy candidates for a word (distance 1 -> +/-1) */
+function fuzzyCandidates(lw, sw) {
+  const seen = new Set();
+  const out = [];
+  for (const form of [lw, sw]) {
+    for (let n = form.length - 1; n <= form.length + 1; n++) {
+      const bucket = FUZZY_BY_LEN.get(n);
+      if (!bucket) continue;
+      for (const cand of bucket) {
+        if (!seen.has(cand)) {
+          seen.add(cand);
+          out.push(cand);
+        }
+      }
+    }
+  }
+  return out;
 }
 
 /* Returns the matched (stemmed) term, or null when the text is allowed. */
@@ -218,16 +377,46 @@ function findBlockedTerm(text) {
   const t = normText(text);
   if (!t) return null;
   const words = t.split(' ');
+  const stemmed = [];
   for (const w of words) {
-    const sw = stemWord(w);
-    if (SAFE_WORDS.has(sw)) return sw;
-    for (const p of SAFE_PREFIXES) {
-      if (w.startsWith(p)) return p;
-    }
+    const hit = wordBlocked(w);
+    if (hit) return hit;
+    stemmed.push(stemWord(w));
   }
-  const flat = ' ' + words.map(stemWord).join(' ') + ' ';
+  const flat = ' ' + stemmed.join(' ') + ' ';
   for (const ph of SAFE_PHRASES) {
     if (flat.indexOf(' ' + ph + ' ') >= 0) return ph;
+  }
+  /* leet-normalized phrase pass ("b1k1n1 t0p" style) */
+  const flatLeet = ' ' + words.map((w) => stemWord(leetify(w))).join(' ') + ' ';
+  if (flatLeet !== flat) {
+    for (const ph of SAFE_PHRASES) {
+      if (flatLeet.indexOf(' ' + ph + ' ') >= 0) return ph;
+    }
+  }
+  return null;
+}
+
+/* Query-level check: everything findBlockedTerm does, plus a
+ * collapsed pass that joins the words back together, so a blocked
+ * word typed with a space in it ("leg gings", "bik ini") still hits. */
+function queryBlockedTerm(q) {
+  const direct = findBlockedTerm(q);
+  if (direct) return direct;
+  const words = normText(q).split(' ');
+  if (words.length > 1) {
+    const joined = words.join('');
+    if (joined.length >= 4) {
+      const hit = wordBlocked(joined);
+      if (hit) return hit;
+      const j = leetify(joined);
+      if (SAFE_JOINED.has(j) || SAFE_JOINED.has(stemWord(j))) return j;
+    }
+    const leet = leetify(joined);
+    if (leet !== joined) {
+      const hit2 = wordBlocked(leet);
+      if (hit2) return hit2;
+    }
   }
   return null;
 }
@@ -621,6 +810,61 @@ function looksLikeCode(t) {
   return CODE_JUNK_RE.test(t);
 }
 
+/* --- HTML entity decoding ---------------------------------------- */
+/* Cloudflare's HTMLRewriter hands text chunks and attribute values
+ * through RAW - "Men&#39;s" stays "Men&#39;s". Amazon escapes apostrophes
+ * (&#39;), inch marks (&quot;) and ampersands (&amp;) in titles, bullets,
+ * descriptions and detail tables, and DOUBLE-escapes img alt / aria
+ * attributes ("&amp;#39;"). Every piece of display text therefore goes
+ * through decodeEntities(), and attribute text through attrText()
+ * (two passes, because of the double escaping). */
+const NAMED_ENTITIES = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+  hellip: '\u2026', ndash: '\u2013', mdash: '\u2014', lsquo: '\u2018', rsquo: '\u2019',
+  ldquo: '\u201c', rdquo: '\u201d', laquo: '\u00ab', raquo: '\u00bb', deg: '\u00b0',
+  plusmn: '\u00b1', times: '\u00d7', divide: '\u00f7', frac12: '\u00bd', frac14: '\u00bc',
+  frac34: '\u00be', cent: '\u00a2', pound: '\u00a3', euro: '\u20ac', yen: '\u00a5',
+  copy: '\u00a9', reg: '\u00ae', trade: '\u2122', bull: '\u2022', dagger: '\u2020',
+  sect: '\u00a7', para: '\u00b6', middot: '\u00b7', larr: '\u2190', rarr: '\u2192',
+   szlig: '\u00df', agrave: '\u00e0', aacute: '\u00e1', egrave: '\u00e8', eacute: '\u00e9',
+  euml: '\u00eb', ugrave: '\u00f9', uacute: '\u00fa', uuml: '\u00fc', ccedil: '\u00e7',
+  ntilde: '\u00f1', ocirc: '\u00f4', oacute: '\u00f3', auml: '\u00e4', iexcl: '\u00a1',
+};
+
+function decodeEntities(s) {
+  if (!s || String(s).indexOf('&') < 0) return s == null ? '' : s;
+  return String(s).replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (m, e) => {
+    if (e[0] === '#') {
+      const hex = e[1] === 'x' || e[1] === 'X';
+      const code = parseInt(e.slice(hex ? 2 : 1), hex ? 16 : 10);
+      /* reject nonsense code points, keep the raw text otherwise */
+      if (!(code > 0) || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return m;
+      try {
+        return String.fromCodePoint(code);
+      } catch (err) {
+        return m;
+      }
+    }
+    const v = NAMED_ENTITIES[e.toLowerCase()];
+    return v === undefined ? m : v;
+  });
+}
+
+/* attribute values Amazon double-escapes: decode up to two passes */
+function attrText(v) {
+  let s = decodeEntities(v);
+  if (/&#|&[a-zA-Z][a-zA-Z0-9]*;/.test(s)) s = decodeEntities(s);
+  return s;
+}
+
+/* after decoding, double-escaped markup can surface as literal tags
+ * ("&lt;br&gt;" -> "<br>"); strip such remnants from display text */
+const TAG_REMNANT_RE = /<\/?[a-zA-Z][a-zA-Z0-9]{0,11}(?:\s[^<>]{0,80})?>/g;
+
+function cleanText(s) {
+  return decodeEntities(s).replace(TAG_REMNANT_RE, ' ').replace(/\s+/g, ' ').trim();
+}
+
 function fullSize(u) {
   // "https://.../I/41kN1._AC_US40_.jpg" -> "https://.../I/41kN1.jpg"
   return String(u).replace(/\._[^./?]+(?=\.(?:jpg|jpeg|png|webp|gif))/i, '');
@@ -676,7 +920,7 @@ async function runExtractor(rawHtml, mode, asin) {
         buf += t.text;
       },
       flush() {
-        const v = buf.replace(/\s+/g, ' ').trim();
+        const v = cleanText(buf);
         buf = '';
         if (v && !looksLikeCode(v) && onText) onText(v, tgt);
       },
@@ -701,7 +945,7 @@ async function runExtractor(rawHtml, mode, asin) {
     if (price && listPrice && !(priceNum(listPrice) > priceNum(price))) listPrice = null;
 
     let title = t.title || t.imgAlt || '';
-    if (title) title = title.slice(0, 300);
+    if (title) title = cleanText(title).slice(0, 300);
 
     if (t.img) {
       tiles.push({
@@ -742,23 +986,62 @@ async function runExtractor(rawHtml, mode, asin) {
 
   const tileCtx = () => cur;
 
+  /* Title hygiene: search tiles contain many /dp/ links that are NOT
+   * the title - color-swatch links whose whole text is "+3 other
+   * colors/patterns" (the "+30" / "+26" junk titles), image links,
+   * review links. On apparel tiles the swatches can sit ABOVE the
+   * title, so the first link text must not blindly win. A candidate
+   * must look like a real product name to be accepted. */
+  const SWATCH_JUNK_RE = /^\+\d+\b/; // "+3", "+30 other colors/patterns"
+  function titleish(s) {
+    if (!s || s.length < 4 || s.length > 400) return false;
+    if (SWATCH_JUNK_RE.test(s)) return false;
+    if (/^sponsored\b/i.test(s)) return false;
+    return /[\u00c0-\u02af\u0370-\uffff]|[a-z]/i.test(s); // has a letter
+  }
+
+  /* link → tile context for title collection; null means "never use
+   * this link's text as a title" (swatches, buttons, non-product links) */
+  const titleCtxOf = (el) => {
+    const t = cur;
+    if (!t) return null;
+    const cls = (attr(el, 'class') || '') + ' ' + (attr(el, 'aria-label') || '');
+    if (/swatch/i.test(cls)) return null;
+    const al = attr(el, 'aria-label') || '';
+    if (SWATCH_JUNK_RE.test(al)) return null;
+    if (/^\+?\d+\s*(other\s+)?(colors?|colours?|patterns?|options?)/i.test(al)) return null;
+    const href = attr(el, 'href') || '';
+    if (/sspa/i.test(href)) t.sponsored = true;
+    return t;
+  };
+
   const titleA = makeCollector(
     (text, t) => {
-      if (t && !t.title) t.title = text;
+      if (t && !t.title && titleish(text)) t.title = text;
+    },
+    titleCtxOf
+  );
+
+  /* Sponsored tiles route their title link through /sspa/click?...
+   * with the /dp/ URL-ENCODED, so a[href*="/dp/"] never matches them
+   * (their titles fell back to img alt text). The title anchor's
+   * class a-text-normal is stable across organic and sponsored tiles. */
+  const titleClassA = makeCollector(
+    (text, t) => {
+      if (t && !t.title && titleish(text)) t.title = text;
     },
     (el) => {
       const t = cur;
-      if (t) {
-        const href = attr(el, 'href') || '';
-        if (/sspa/i.test(href)) t.sponsored = true;
-      }
+      if (!t) return null;
+      const href = attr(el, 'href') || '';
+      if (/sspa/i.test(href)) t.sponsored = true;
       return t;
     }
   );
 
   const titleH2 = makeCollector(
     (text, t) => {
-      if (t && !t.title) t.title = text;
+      if (t && !t.title && titleish(text)) t.title = text;
     },
     (el) => {
       const t = cur;
@@ -825,14 +1108,18 @@ async function runExtractor(rawHtml, mode, asin) {
       );
       if (good) {
         cur.img = good;
-        const alt = attr(el, 'alt') || '';
-        if (alt) cur.imgAlt = alt.replace(/\s+/g, ' ').trim().slice(0, 300);
+        /* alt text is double-escaped by Amazon ("&amp;#39;") and often
+         * starts with "Sponsored Ad - " on ad tiles; it is the LAST
+         * resort title fallback, so clean it before storing */
+        const alt = attrText(attr(el, 'alt') || '');
+        if (alt) cur.imgAlt = alt.replace(/^sponsored\s+ad\s*[-–—:]?\s*/i, '').replace(/\s+/g, ' ').trim().slice(0, 300);
       }
     },
   };
 
   let rw = new HTMLRewriter()
     .on('div[data-asin]', tileOpen)
+    .on('div[data-asin] a.a-text-normal', titleClassA)
     .on('div[data-asin] a[href*="/dp/"]', titleA)
     .on('div[data-asin] h2 a', titleH2)
     .on('div[data-asin] .a-price .a-offscreen', priceT)
@@ -880,7 +1167,7 @@ async function runExtractor(rawHtml, mode, asin) {
 
     const metaOg = (prop) => ({
       element(el) {
-        const c = attr(el, 'content') || '';
+        const c = attrText(attr(el, 'content') || '');
         if (c && !product[prop]) product[prop] = c.trim();
       },
     });
@@ -1221,7 +1508,7 @@ async function handleSearch(url, ctx, profile) {
   const idx = /^[a-z0-9-]{2,32}$/.test(i) ? i : '';
 
   if (profile === 'filtered') {
-    if (findBlockedTerm(q)) {
+    if (queryBlockedTerm(q)) {
       return jsonResponse(
         { q, i: idx, page, blocked: true, results: [], hasMore: false, message: 'This search is blocked in Safe Mode.' },
         200
