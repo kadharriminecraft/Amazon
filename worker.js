@@ -40,8 +40,8 @@
      detected automatically and the log survives restarts.
 
    Access control - TWO profiles (edit ACCESS_KEYS below):
-     "unblock" -> full     : normal, unrestricted browsing
-     "safe"    -> filtered : Safe Mode. Searches, results, charts and
+     "Notblocked" -> full     : normal, unrestricted browsing
+     "MissionaryAmazon"    -> filtered : Safe Mode. Searches, results, charts and
                              product pages containing adult or sexual
                              content are blocked here in the worker -
                              the app cannot bypass it. The word list is
