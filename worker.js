@@ -24,20 +24,32 @@
      /api/browse?type=bestsellers|new|movers&cat=SLUG   -> charts (JSON)
      /img?u=<encoded amazon image URL>      -> image bytes
 
-   Filter monitor (for you, the owner):
-     GET  /admin/stats          -> JSON log of everything Safe Mode blocked
+   Filter monitor & key manager (for you, the owner):
+     GET  /admin/stats          -> JSON log of everything the filter caught
                                    (blocked searches, products removed from
                                    results and charts, refused product
-                                   pages - each with the reason)
+                                   pages - each with the reason and the
+                                   access key that was used)
      POST /admin/stats/reset    -> clear the log
-     Both need the admin password (ADMIN_PASSWORD below) as the header
+     GET  /admin/keys           -> the live access-key list
+     POST /admin/keys           -> add or edit a key  {id?, key, label, profile}
+     POST /admin/keys/delete    -> revoke a key      {id}
+     All need the admin password (ADMIN_PASSWORD below) as the header
      "x-admin-key" (or ?adminKey=). Pair this with amazon-admin.html - a
-     single-file dashboard that asks for the password and shows the log.
+     single-file dashboard that asks for the password, shows the log,
+     and has a Keys tab where you add, rename, re-mode or revoke access
+     keys. profile "filtered" = Normal mode (the filter is enforced),
+     "full" = Unrestricted. In Unrestricted mode nothing is hidden - but
+     anything the filter WOULD have caught is still logged, flagged as
+     "shown", so you can see who searched what either way.
      Storage: in worker memory by default (kept while the worker stays
-     warm; cleared by a redeploy or an idle restart). For permanent
-     storage, create a KV namespace in the Cloudflare dashboard and bind
-     it to this worker under the name FILTER_STATS - the binding is
-     detected automatically and the log survives restarts.
+     warm; cleared by a redeploy or an idle restart - if the dashboard
+     "sometimes forgets" the log, that is why). For permanent storage,
+     create a KV namespace in the Cloudflare dashboard and bind it to
+     this worker under the name FILTER_STATS - the binding is detected
+     automatically and the log AND the key list survive restarts.
+     (Bind KV before managing keys; without it, key edits stick only to
+     the isolate that saved them.)
 
    Access control - TWO profiles (edit ACCESS_KEYS below):
      "notblocked"        -> full     : normal, unrestricted browsing
@@ -93,7 +105,9 @@ const DESKTOP_UA =
 
 /* Access-key -> profile map. 'full' = unrestricted, 'filtered' = Safe Mode.
  * Rename keys / add entries as you like; {} disables the gate entirely.
- * Keys are matched EXACTLY (after trimming spaces), capitals included. */
+ * Keys are matched EXACTLY (after trimming spaces), capitals included.
+ * You can also manage keys LIVE from the Filter Monitor's Keys tab
+ * (no redeploy needed) - see "Live access keys" further down. */
 const ACCESS_KEYS = {
   notblocked: 'full',
   'Missionary Amazon': 'filtered',
@@ -148,6 +162,113 @@ function getAccessProfile(key) {
   const k = String(key == null ? '' : key).trim();
   if (!Object.prototype.hasOwnProperty.call(ACCESS_KEYS, k)) return null;
   return ACCESS_KEYS[k] === 'filtered' ? 'filtered' : 'full';
+}
+
+/* ================================================================== */
+/* Live access keys (managed from the Filter Monitor's Keys tab)       */
+/*                                                                     */
+/* The editable list lives in the FILTER_STATS KV namespace under      */
+/* 'access-keys-v1' as [{id, key, label, profile, createdAt}]. Until   */
+/* the first edit it is unset and the STATIC ACCESS_KEYS above rule;   */
+/* the monitor seeds the editable list from them. Once the list exists */
+/* it is the only authority - edit or delete the seeded entries there. */
+/* Deleting every entry hands control back to the static map, so an    */
+/* empty list can never lock everybody out. Without a KV binding the   */
+/* list lives in worker memory only (see the monitor's storage note).  */
+/* ================================================================== */
+
+const KEYS_KV_KEY = 'access-keys-v1';
+
+let dynKeys = null; /* null = unset -> static ACCESS_KEYS rule */
+let dynKeysLoadPromise = null;
+
+function seedKeysFromStatic() {
+  return Object.keys(ACCESS_KEYS).map((k) => ({
+    id: 'static:' + k,
+    key: k,
+    label: k,
+    profile: ACCESS_KEYS[k] === 'filtered' ? 'filtered' : 'full',
+    createdAt: 0,
+  }));
+}
+
+function normalizeKeyList(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const e of arr || []) {
+    if (!e || typeof e.key !== 'string') continue;
+    const key = e.key.trim();
+    if (!key || key.length > 64 || seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      id: String(e.id || 'k-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7)),
+      key,
+      label: String(e.label || key).slice(0, 40),
+      profile: e.profile === 'filtered' ? 'filtered' : 'full',
+      createdAt: e.createdAt || 0,
+    });
+  }
+  return out;
+}
+
+function loadDynKeys(env) {
+  if (!dynKeysLoadPromise) {
+    dynKeysLoadPromise = (async () => {
+      try {
+        if (env && env.FILTER_STATS && typeof env.FILTER_STATS.get === 'function') {
+          const raw = await env.FILTER_STATS.get(KEYS_KV_KEY);
+          if (raw) {
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr)) dynKeys = normalizeKeyList(arr);
+          }
+        }
+      } catch (e) {}
+    })();
+  }
+  return dynKeysLoadPromise;
+}
+
+/* the list that rules right now (seeded from the static map while the
+ * editable list has never been saved) */
+async function effectiveKeys(env) {
+  await loadDynKeys(env);
+  return dynKeys && dynKeys.length ? dynKeys : seedKeysFromStatic();
+}
+
+async function saveKeyList(env, ctx, list) {
+  const norm = normalizeKeyList(list);
+  dynKeys = norm.length ? norm : null;
+  try {
+    if (env && env.FILTER_STATS && typeof env.FILTER_STATS.put === 'function') {
+      if (norm.length) {
+        const put = env.FILTER_STATS.put(KEYS_KV_KEY, JSON.stringify(norm)).catch(() => {});
+        if (ctx && ctx.waitUntil) ctx.waitUntil(put);
+        else await put;
+      } else if (typeof env.FILTER_STATS.delete === 'function') {
+        const del = env.FILTER_STATS.delete(KEYS_KV_KEY).catch(() => {});
+        if (ctx && ctx.waitUntil) ctx.waitUntil(del);
+        else await del;
+      }
+    }
+  } catch (e) {}
+  return norm;
+}
+
+/* Access check for real requests: the live list when one exists, the
+ * static map otherwise. Returns { profile, key } or null (401). The
+ * returned key string rides along into the filter log so the monitor
+ * can show WHO searched what. */
+async function resolveAccess(keyStr, env) {
+  await loadDynKeys(env);
+  const k = String(keyStr == null ? '' : keyStr).trim();
+  if (dynKeys && dynKeys.length) {
+    const e = dynKeys.find((x) => x.key === k);
+    if (!e) return null;
+    return { profile: e.profile === 'filtered' ? 'filtered' : 'full', key: e.key };
+  }
+  const profile = getAccessProfile(k);
+  if (!profile) return null;
+  return { profile, key: k };
 }
 
 /* ================================================================== */
@@ -491,22 +612,40 @@ function sanitizeProduct(p, related) {
 /* ================================================================== */
 /* Filter activity log (the /admin/stats monitor)                      */
 /*                                                                     */
-/* Every Safe Mode block is recorded here so amazon-admin.html can    */
-/* show what was blocked and why:                                      */
-/*   { type:'search',  q, reason, via:'word'|'category' }              */
+/* Everything the filter catches is recorded here so amazon-admin.html */
+/* can show what happened, why, and with which access key:             */
+/*   { type:'search',  q, reason, via:'word'|'category', key,          */
+/*     flagged? }                                                      */
 /*   { type:'results', source:'search'|'browse', q, page?, removed:[{  */
-/*                       title, asin, reason }], count, shown }        */
-/*   { type:'product', asin, title, reason }                           */
-/* The log lives in worker memory; when a KV namespace is bound as    */
-/* FILTER_STATS it is also written there and reloaded on cold starts.  */
+/*                       title, asin, reason }], count, shown, key,    */
+/*     flagged? }                                                      */
+/*   { type:'product', asin, title, reason, key, flagged? }            */
+/* flagged:true = the request ran with an UNRESTRICTED key: nothing    */
+/* was hidden, the event only notes that the filter WOULD have caught  */
+/* it (the admin page marks those "not blocked - flagged, shown").     */
+/*                                                                     */
+/* Persistence (when a KV namespace is bound as FILTER_STATS): every   */
+/* write is a read-merge-write that unions events by id, so several    */
+/* worker isolates logging at the same time never erase each other's    */
+/* events. /admin/stats/reset leaves a tombstone timestamp; late       */
+/* writes from isolates that booted before the reset drop anything     */
+/* older, so cleared events cannot come back.                          */
 /* ================================================================== */
 
 const STATS_KV_KEY = 'filter-stats-v1';
+const STATS_CLEARED_KV_KEY = 'filter-stats-cleared-v1';
 const CACHE_GEN_KV_KEY = 'cache-generation-v1';
 const MAX_STATS_EVENTS = 500;
 
 function zeroTotals() {
-  return { blockedSearches: 0, removedTiles: 0, blockedProducts: 0 };
+  return {
+    blockedSearches: 0,
+    removedTiles: 0,
+    blockedProducts: 0,
+    flaggedSearches: 0,
+    flaggedTiles: 0,
+    flaggedProducts: 0,
+  };
 }
 
 const stats = {
@@ -514,7 +653,11 @@ const stats = {
   events: [], /* oldest first, capped at MAX_STATS_EVENTS */
   totals: zeroTotals(),
   queryCounts: {}, /* normalized blocked query -> how many times */
+  keyTotals: {}, /* access key -> zeroTotals()-shaped counters */
 };
+
+/* events at or before this timestamp were cleared by /admin/stats/reset */
+let clearedTs = 0;
 
 let statsLoadPromise = null;
 
@@ -541,7 +684,15 @@ function loadStats(env) {
               stats.events = s.events.slice(-MAX_STATS_EVENTS);
               stats.totals = Object.assign(zeroTotals(), s.totals || {});
               stats.queryCounts = s.queryCounts || {};
+              stats.keyTotals = s.keyTotals || {};
             }
+          }
+          /* the reset tombstone: anything at or before it was cleared */
+          const t = await env.FILTER_STATS.get(STATS_CLEARED_KV_KEY);
+          const tn = parseInt(t || '', 10);
+          if (!isNaN(tn) && tn > 0) {
+            clearedTs = tn;
+            stats.events = stats.events.filter((ev) => (ev.ts || 0) > clearedTs);
           }
           const g = await env.FILTER_STATS.get(CACHE_GEN_KV_KEY);
           const n = parseInt(g || '', 10);
@@ -556,10 +707,91 @@ function loadStats(env) {
 function persistStats(env, ctx) {
   try {
     if (env && env.FILTER_STATS && typeof env.FILTER_STATS.put === 'function') {
-      const put = env.FILTER_STATS.put(STATS_KV_KEY, JSON.stringify(stats)).catch(() => {});
-      if (ctx && ctx.waitUntil) ctx.waitUntil(put);
+      /* read-merge-write: the KV copy is re-read first and unioned with
+       * this isolate's events BY ID, so a snapshot held by another
+       * isolate can never erase events it has not seen */
+      const job = (async () => {
+        let kv = null;
+        try {
+          const raw = await env.FILTER_STATS.get(STATS_KV_KEY);
+          if (raw) kv = JSON.parse(raw);
+        } catch (e) {}
+        await env.FILTER_STATS.put(STATS_KV_KEY, JSON.stringify(mergeStats(kv, stats)));
+      })().catch(() => {});
+      if (ctx && ctx.waitUntil) ctx.waitUntil(job);
     }
   } catch (e) {}
+}
+
+/* union of two log snapshots: events merge by id (newest survive the
+ * MAX cap), counters merge per field with max() so they never go
+ * backwards and never double-count, and the reset tombstone drops
+ * anything /admin/stats/reset cleared */
+function mergeStats(kv, local) {
+  const byId = new Map();
+  for (const ev of (kv && kv.events) || []) {
+    if (ev && ev.id && (!clearedTs || (ev.ts || 0) > clearedTs)) byId.set(ev.id, ev);
+  }
+  for (const ev of (local && local.events) || []) {
+    if (ev && ev.id && (!clearedTs || (ev.ts || 0) > clearedTs)) byId.set(ev.id, ev);
+  }
+  const events = Array.from(byId.values()).sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  if (events.length > MAX_STATS_EVENTS) events.splice(0, events.length - MAX_STATS_EVENTS);
+
+  const totals = zeroTotals();
+  for (const side of [kv, local]) {
+    if (!side || !side.totals) continue;
+    for (const f of Object.keys(totals)) {
+      totals[f] = Math.max(totals[f], side.totals[f] || 0);
+    }
+  }
+
+  const queryCounts = {};
+  for (const side of [kv, local]) {
+    if (!side || !side.queryCounts) continue;
+    for (const k of Object.keys(side.queryCounts)) {
+      queryCounts[k] = Math.max(queryCounts[k] || 0, side.queryCounts[k] || 0);
+    }
+  }
+
+  const keyTotals = {};
+  for (const side of [kv, local]) {
+    if (!side || !side.keyTotals) continue;
+    for (const k of Object.keys(side.keyTotals)) {
+      const a = keyTotals[k] || {};
+      const b = side.keyTotals[k] || {};
+      for (const f of Object.keys(zeroTotals())) {
+        a[f] = Math.max(a[f] || 0, b[f] || 0);
+      }
+      keyTotals[k] = a;
+    }
+  }
+
+  const since = Math.min((kv && kv.since) || Infinity, (local && local.since) || Infinity);
+  return { since: since === Infinity ? 0 : since, events, totals, queryCounts, keyTotals };
+}
+
+/* what /admin/stats answers: the freshest KV state merged with this
+ * isolate's own events - the dashboard always reflects every isolate */
+async function adminStatsView(env) {
+  if (env && env.FILTER_STATS && typeof env.FILTER_STATS.get === 'function') {
+    let kv = null;
+    try {
+      const raw = await env.FILTER_STATS.get(STATS_KV_KEY);
+      if (raw) kv = JSON.parse(raw);
+      const t = await env.FILTER_STATS.get(STATS_CLEARED_KV_KEY);
+      const tn = parseInt(t || '', 10);
+      if (!isNaN(tn) && tn > clearedTs) clearedTs = tn;
+    } catch (e) {}
+    return mergeStats(kv, stats);
+  }
+  return {
+    since: stats.since,
+    events: stats.events,
+    totals: stats.totals,
+    queryCounts: stats.queryCounts,
+    keyTotals: stats.keyTotals,
+  };
 }
 
 function logStats(env, ctx, ev) {
@@ -569,14 +801,34 @@ function logStats(env, ctx, ev) {
   if (stats.events.length > MAX_STATS_EVENTS) {
     stats.events.splice(0, stats.events.length - MAX_STATS_EVENTS);
   }
+  const n = ev.type === 'results' ? ev.count || (ev.removed || []).length : 0;
   if (ev.type === 'search') {
-    stats.totals.blockedSearches++;
-    const k = normText(ev.q) || String(ev.q || '');
-    stats.queryCounts[k] = (stats.queryCounts[k] || 0) + 1;
+    if (ev.flagged) stats.totals.flaggedSearches++;
+    else {
+      stats.totals.blockedSearches++;
+      const k = normText(ev.q) || String(ev.q || '');
+      stats.queryCounts[k] = (stats.queryCounts[k] || 0) + 1;
+    }
   } else if (ev.type === 'results') {
-    stats.totals.removedTiles += ev.count || (ev.removed || []).length;
+    if (ev.flagged) stats.totals.flaggedTiles += n;
+    else stats.totals.removedTiles += n;
   } else if (ev.type === 'product') {
-    stats.totals.blockedProducts++;
+    if (ev.flagged) stats.totals.flaggedProducts++;
+    else stats.totals.blockedProducts++;
+  }
+  /* per-person counters (the access key string is the index) */
+  if (ev.key) {
+    const kt = stats.keyTotals[ev.key] || (stats.keyTotals[ev.key] = zeroTotals());
+    if (ev.type === 'search') {
+      if (ev.flagged) kt.flaggedSearches++;
+      else kt.blockedSearches++;
+    } else if (ev.type === 'results') {
+      if (ev.flagged) kt.flaggedTiles += n;
+      else kt.removedTiles += n;
+    } else if (ev.type === 'product') {
+      if (ev.flagged) kt.flaggedProducts++;
+      else kt.blockedProducts++;
+    }
   }
   persistStats(env, ctx);
 }
@@ -594,8 +846,14 @@ export default {
     const url = new URL(request.url);
     const p = (url.pathname || '/').replace(/\/+$/, '') || '/';
 
-    /* filter monitor: own password, independent of the access keys */
-    if (p === '/admin/stats' || p === '/admin/stats/reset') {
+    /* filter monitor + key manager: own password, independent of the
+     * access keys */
+    if (
+      p === '/admin/stats' ||
+      p === '/admin/stats/reset' ||
+      p === '/admin/keys' ||
+      p === '/admin/keys/delete'
+    ) {
       return handleAdmin(request, url, p, env, ctx);
     }
 
@@ -606,12 +864,15 @@ export default {
     /* pulls the saved log from KV once per isolate (no-op without one) */
     await loadStats(env);
 
-    const profile = getAccessProfile(
-      request.headers.get('x-access-key') || url.searchParams.get('key') || ''
+    const access = await resolveAccess(
+      request.headers.get('x-access-key') || url.searchParams.get('key') || '',
+      env
     );
-    if (!profile) {
+    if (!access) {
       return jsonResponse({ error: 'unauthorized', message: 'Bad or missing access key' }, 401);
     }
+    const profile = access.profile;
+    const akey = access.key; /* rides into the filter log: who did it */
 
     try {
       if (p === '/' || p === '/health') {
@@ -621,9 +882,9 @@ export default {
         return await proxyImage(ctx, url.searchParams.get('u') || '');
       }
       if (p === '/api/cache-wipe') return handleCacheWipe(url, ctx, env);
-      if (p === '/api/search') return await handleSearch(url, ctx, profile, env);
-      if (p.startsWith('/api/product/')) return await handleProduct(url, ctx, profile, env);
-      if (p === '/api/browse') return await handleBrowse(url, ctx, profile, env);
+      if (p === '/api/search') return await handleSearch(url, ctx, profile, env, akey);
+      if (p.startsWith('/api/product/')) return await handleProduct(url, ctx, profile, env, akey);
+      if (p === '/api/browse') return await handleBrowse(url, ctx, profile, env, akey);
 
       return jsonResponse({ error: 'not_found', message: 'Unknown route: ' + p }, 404);
     } catch (e) {
@@ -1730,23 +1991,98 @@ async function handleAdmin(request, url, p, env, ctx) {
 
   await loadStats(env);
 
+  const kvBound = !!(env && env.FILTER_STATS && typeof env.FILTER_STATS.get === 'function');
+
+  /* ---------- live access keys (the monitor's Keys tab) ---------- */
+  if (p === '/admin/keys' || p === '/admin/keys/delete') {
+    if (request.method !== 'GET' && request.method !== 'HEAD' && request.method !== 'POST') {
+      return jsonResponse({ error: 'bad_request', message: 'GET or POST only' }, 405, NO_STORE);
+    }
+
+    if (p === '/admin/keys' && (request.method === 'GET' || request.method === 'HEAD')) {
+      return jsonResponse(
+        { ok: true, storage: kvBound ? 'kv' : 'memory', keys: await effectiveKeys(env) },
+        200,
+        NO_STORE
+      );
+    }
+
+    let body = null;
+    try {
+      body = await request.json();
+    } catch (e) {}
+    if (!body || typeof body !== 'object') {
+      return jsonResponse({ error: 'bad_request', message: 'JSON body required' }, 400, NO_STORE);
+    }
+
+    const list = await effectiveKeys(env);
+
+    if (p === '/admin/keys/delete') {
+      const id = String(body.id || '');
+      const i = list.findIndex((x) => x.id === id);
+      if (i < 0) return jsonResponse({ error: 'not_found', message: 'No key with that id' }, 404, NO_STORE);
+      list.splice(i, 1);
+      const saved = await saveKeyList(env, ctx, list);
+      return jsonResponse({ ok: true, revoked: id, keys: saved }, 200, NO_STORE);
+    }
+
+    /* add or edit */
+    const keyStr = String(body.key || '').trim();
+    const label = String(body.label || '').trim().slice(0, 40);
+    const profile = body.profile === 'filtered' ? 'filtered' : 'full';
+    if (!keyStr || keyStr.length > 64) {
+      return jsonResponse({ error: 'bad_request', message: 'Key must be 1-64 characters.' }, 400, NO_STORE);
+    }
+
+    let entry;
+    if (body.id) {
+      entry = list.find((x) => x.id === String(body.id));
+      if (!entry) {
+        return jsonResponse({ error: 'not_found', message: 'No key with that id' }, 404, NO_STORE);
+      }
+      if (list.some((x) => x !== entry && x.key === keyStr)) {
+        return jsonResponse({ error: 'conflict', message: 'Another key already uses that text.' }, 409, NO_STORE);
+      }
+      entry.key = keyStr;
+      entry.label = label || keyStr;
+      entry.profile = profile;
+    } else {
+      if (list.some((x) => x.key === keyStr)) {
+        return jsonResponse({ error: 'conflict', message: 'That key already exists.' }, 409, NO_STORE);
+      }
+      entry = {
+        id: 'k-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7),
+        key: keyStr,
+        label: label || keyStr,
+        profile,
+        createdAt: Date.now(),
+      };
+      list.push(entry);
+    }
+    const saved = await saveKeyList(env, ctx, list);
+    return jsonResponse({ ok: true, keys: saved }, 200, NO_STORE);
+  }
+
   if (p === '/admin/stats') {
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       return jsonResponse({ error: 'bad_request', message: 'GET only' }, 405, NO_STORE);
     }
-    const events = stats.events.slice().reverse(); /* newest first */
-    const topQueries = Object.keys(stats.queryCounts)
-      .map((k) => [k, stats.queryCounts[k]])
+    const view = await adminStatsView(env);
+    const events = view.events.slice().reverse(); /* newest first */
+    const topQueries = Object.keys(view.queryCounts)
+      .map((k) => [k, view.queryCounts[k]])
       .sort((a, b) => b[1] - a[1])
       .slice(0, 12);
     return jsonResponse(
       {
         ok: true,
-        storage: env && env.FILTER_STATS ? 'kv' : 'memory',
-        since: stats.since,
+        storage: kvBound ? 'kv' : 'memory',
+        since: view.since,
         now: Date.now(),
-        totals: stats.totals,
+        totals: view.totals,
         topQueries,
+        keyTotals: view.keyTotals,
+        keys: await effectiveKeys(env),
         events,
       },
       200,
@@ -1762,11 +2098,18 @@ async function handleAdmin(request, url, p, env, ctx) {
     stats.events = [];
     stats.totals = zeroTotals();
     stats.queryCounts = {};
+    stats.keyTotals = {};
+    clearedTs = Date.now();
     try {
-      if (env && env.FILTER_STATS && typeof env.FILTER_STATS.delete === 'function') {
-        const d = env.FILTER_STATS.delete(STATS_KV_KEY).catch(() => {});
-        if (ctx && ctx.waitUntil) ctx.waitUntil(d);
-        else await d;
+      if (env && env.FILTER_STATS && typeof env.FILTER_STATS.put === 'function') {
+        /* tombstone first: late writers from other isolates drop
+         * anything older than this instead of resurrecting it */
+        await env.FILTER_STATS.put(STATS_CLEARED_KV_KEY, String(clearedTs));
+        if (typeof env.FILTER_STATS.delete === 'function') {
+          const d = env.FILTER_STATS.delete(STATS_KV_KEY).catch(() => {});
+          if (ctx && ctx.waitUntil) ctx.waitUntil(d);
+          else await d;
+        }
       }
     } catch (e) {}
     return jsonResponse({ ok: true, cleared: true }, 200, NO_STORE);
@@ -1777,7 +2120,7 @@ async function handleAdmin(request, url, p, env, ctx) {
 
 /* ---------- search ---------- */
 
-async function handleSearch(url, ctx, profile, env) {
+async function handleSearch(url, ctx, profile, env, akey) {
   const q = (url.searchParams.get('q') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
   const i = url.searchParams.get('i') || '';
   const page = Math.min(50, Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1));
@@ -1785,24 +2128,22 @@ async function handleSearch(url, ctx, profile, env) {
 
   const idx = /^[a-z0-9-]{2,32}$/.test(i) ? i : '';
 
-  if (profile === 'filtered') {
-    const hit = queryBlockedTerm(q);
-    if (hit) {
-      logStats(env, ctx, { type: 'search', q, reason: hit, via: 'word' });
+  const wordHit = queryBlockedTerm(q);
+  const deptHit = idx && BLOCKED_DEPTS.indexOf(idx) >= 0 ? idx : null;
+  if (wordHit || deptHit) {
+    const reason = wordHit || deptHit;
+    const via = wordHit ? 'word' : 'category';
+    if (profile === 'filtered') {
+      logStats(env, ctx, { type: 'search', q, reason, via, key: akey });
       return jsonResponse(
-        { q, i: idx, page, blocked: true, results: [], hasMore: false, message: 'This search is blocked in Safe Mode.' },
+        { q, i: idx, page, blocked: true, results: [], hasMore: false, message: 'The worker denied this search.' },
         200,
         { 'cache-control': 'no-store' }
       );
     }
-    if (idx && BLOCKED_DEPTS.indexOf(idx) >= 0) {
-      logStats(env, ctx, { type: 'search', q, reason: idx, via: 'category' });
-      return jsonResponse(
-        { q, i: idx, page, blocked: true, results: [], hasMore: false, message: 'This category is blocked in Safe Mode.' },
-        200,
-        { 'cache-control': 'no-store' }
-      );
-    }
+    /* Unrestricted key: nothing is hidden, but the would-be catch is
+     * logged as flagged so the monitor shows who searched it */
+    logStats(env, ctx, { type: 'search', q, reason, via, flagged: true, key: akey });
   }
 
   const target = '/s?k=' + encodeURIComponent(q) + (idx ? '&i=' + idx : '') + '&page=' + page;
@@ -1841,6 +2182,28 @@ async function handleSearch(url, ctx, profile, env) {
         removed: removed.slice(0, 25),
         count: removed.length,
         shown: kept.length,
+        key: akey,
+      });
+    }
+  } else {
+    /* Unrestricted key: every tile is shown, but the ones the filter
+     * WOULD remove are logged as flagged ("not blocked, shown") */
+    const flagged = [];
+    for (const t of data.tiles) {
+      const term = tileBlockedTerm(t);
+      if (term) flagged.push({ title: String(t.title || '').slice(0, 140), asin: t.asin, reason: term });
+    }
+    if (flagged.length) {
+      logStats(env, ctx, {
+        type: 'results',
+        source: 'search',
+        q,
+        page,
+        removed: flagged.slice(0, 25),
+        count: flagged.length,
+        shown: data.tiles.length,
+        flagged: true,
+        key: akey,
       });
     }
   }
@@ -1851,12 +2214,12 @@ async function handleSearch(url, ctx, profile, env) {
 
 /* ---------- product ---------- */
 
-async function handleProduct(url, ctx, profile, env) {
+async function handleProduct(url, ctx, profile, env, akey) {
   const m = url.pathname.match(/^\/api\/product\/([A-Z0-9]{10})$/i);
   if (!m) return jsonResponse({ error: 'bad_request', message: 'Bad ASIN' }, 400);
   const asin = m[1].toUpperCase();
 
-  /* the RAW product is cached (shared by both profiles); the Safe Mode
+  /* the RAW product is cached (shared by both profiles); the filter
    * verdict, sanitize and logging run on every request */
   const data = await cachedData(ctx, 'product|' + asin, TTL.product, async () => {
     const html = await getAmazonHTML('/dp/' + asin);
@@ -1867,22 +2230,34 @@ async function handleProduct(url, ctx, profile, env) {
     return { product, related };
   });
 
+  const term = productBlockedTerm(data.product);
   if (profile === 'filtered') {
-    const term = productBlockedTerm(data.product);
     if (term) {
       logStats(env, ctx, {
         type: 'product',
         asin,
         title: String(data.product.title || '').slice(0, 140),
         reason: term,
+        key: akey,
       });
       return jsonResponse(
-        { asin, blocked: true, message: 'This item is blocked in Safe Mode.' },
+        { asin, blocked: true, message: 'The worker denied this item.' },
         200,
         { 'cache-control': 'no-store' }
       );
     }
     return jsonResponse(sanitizeProduct(data.product, data.related));
+  }
+  /* Unrestricted key: the item is shown anyway, but noted as flagged */
+  if (term) {
+    logStats(env, ctx, {
+      type: 'product',
+      asin,
+      title: String(data.product.title || '').slice(0, 140),
+      reason: term,
+      flagged: true,
+      key: akey,
+    });
   }
   return jsonResponse({ ...data.product, related: data.related });
 }
@@ -1924,7 +2299,7 @@ function cleanSectionTitle(t) {
     .slice(0, 60);
 }
 
-async function handleBrowse(url, ctx, profile, env) {
+async function handleBrowse(url, ctx, profile, env, akey) {
   const typeRaw = url.searchParams.get('type') || 'bestsellers';
   const type = BROWSE_TYPES[typeRaw] || 'bestsellers';
   const cat = (url.searchParams.get('cat') || '').toLowerCase();
@@ -1977,6 +2352,29 @@ async function handleBrowse(url, ctx, profile, env) {
         removed: removed.slice(0, 25),
         count: removed.length,
         shown: keptAll.length,
+        key: akey,
+      });
+    }
+  } else {
+    /* Unrestricted key: nothing is dropped from the chart, but items
+     * the filter WOULD remove are logged as flagged */
+    const flagged = [];
+    for (const s of sections) {
+      for (const t of s.items || []) {
+        const term = tileBlockedTerm(t);
+        if (term) flagged.push({ title: String(t.title || '').slice(0, 140), asin: t.asin, reason: term });
+      }
+    }
+    if (flagged.length) {
+      logStats(env, ctx, {
+        type: 'results',
+        source: 'browse',
+        q: type + (catOk ? ' - ' + catOk : ''),
+        removed: flagged.slice(0, 25),
+        count: flagged.length,
+        shown: items.length,
+        flagged: true,
+        key: akey,
       });
     }
   }
