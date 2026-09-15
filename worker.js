@@ -24,6 +24,21 @@
      /api/browse?type=bestsellers|new|movers&cat=SLUG   -> charts (JSON)
      /img?u=<encoded amazon image URL>      -> image bytes
 
+   Filter monitor (for you, the owner):
+     GET  /admin/stats          -> JSON log of everything Safe Mode blocked
+                                   (blocked searches, products removed from
+                                   results and charts, refused product
+                                   pages - each with the reason)
+     POST /admin/stats/reset    -> clear the log
+     Both need the admin password (ADMIN_PASSWORD below) as the header
+     "adminkey" (or ?adminKey=). Pair this with amazon-admin.html - a
+     single-file dashboard that asks for the password and shows the log.
+     Storage: in worker memory by default (kept while the worker stays
+     warm; cleared by a redeploy or an idle restart). For permanent
+     storage, create a KV namespace in the Cloudflare dashboard and bind
+     it to this worker under the name FILTER_STATS - the binding is
+     detected automatically and the log survives restarts.
+
    Access control - TWO profiles (edit ACCESS_KEYS below):
      "unblock" -> full     : normal, unrestricted browsing
      "safe"    -> filtered : Safe Mode. Searches, results, charts and
@@ -72,13 +87,19 @@ const ACCESS_KEYS = {
   safe: 'filtered',
 };
 
+/* Password for the /admin/stats filter monitor (used by amazon-admin.html).
+ * CHANGE THIS to your own secret. The monitor answers only to this
+ * password, separate from the access keys above. Empty string ''
+ * disables the monitor endpoints entirely. */
+const ADMIN_PASSWORD = 'letmein';
+
 const FETCH_TIMEOUT_MS = 20000;
 
 const TTL = { search: 600, product: 3600, browse: 900 }; // seconds
 
 const CORS = {
   'access-control-allow-origin': '*',
-  'access-control-allow-methods': 'GET, OPTIONS',
+  'access-control-allow-methods': 'GET, POST, OPTIONS',
   'access-control-allow-headers': '*',
   'access-control-max-age': '86400',
 };
@@ -421,18 +442,25 @@ function queryBlockedTerm(q) {
   return null;
 }
 
+/* the matched (stemmed) term, or null when the tile is allowed */
+function tileBlockedTerm(t) {
+  return t && t.title ? findBlockedTerm(t.title) : null;
+}
 function tileBlocked(t) {
-  return !!findBlockedTerm(t && t.title ? t.title : '');
+  return !!tileBlockedTerm(t);
 }
 
-function productBlocked(p) {
+function productBlockedTerm(p) {
   const text = [
     p.title || '',
     p.brand || '',
     (p.crumbs || []).join(' '),
     (p.bullets || []).join(' '),
   ].join(' ');
-  return !!findBlockedTerm(text);
+  return findBlockedTerm(text);
+}
+function productBlocked(p) {
+  return !!productBlockedTerm(p);
 }
 
 function sanitizeProduct(p, related) {
@@ -449,19 +477,110 @@ function sanitizeProduct(p, related) {
 }
 
 /* ================================================================== */
+/* Filter activity log (the /admin/stats monitor)                      */
+/*                                                                     */
+/* Every Safe Mode block is recorded here so amazon-admin.html can    */
+/* show what was blocked and why:                                      */
+/*   { type:'search',  q, reason, via:'word'|'category' }              */
+/*   { type:'results', source:'search'|'browse', q, page?, removed:[{  */
+/*                       title, asin, reason }], count, shown }        */
+/*   { type:'product', asin, title, reason }                           */
+/* The log lives in worker memory; when a KV namespace is bound as    */
+/* FILTER_STATS it is also written there and reloaded on cold starts.  */
+/* ================================================================== */
+
+const STATS_KV_KEY = 'filter-stats-v1';
+const MAX_STATS_EVENTS = 500;
+
+function zeroTotals() {
+  return { blockedSearches: 0, removedTiles: 0, blockedProducts: 0 };
+}
+
+const stats = {
+  since: 0, /* when tracking started */
+  events: [], /* oldest first, capped at MAX_STATS_EVENTS */
+  totals: zeroTotals(),
+  queryCounts: {}, /* normalized blocked query -> how many times */
+};
+
+let statsLoadPromise = null;
+
+/* one-time per isolate: pull the saved log from KV when one is bound */
+function loadStats(env) {
+  if (!statsLoadPromise) {
+    statsLoadPromise = (async () => {
+      stats.since = Date.now();
+      try {
+        if (env && env.FILTER_STATS && typeof env.FILTER_STATS.get === 'function') {
+          const raw = await env.FILTER_STATS.get(STATS_KV_KEY);
+          if (raw) {
+            const s = JSON.parse(raw);
+            if (s && Array.isArray(s.events)) {
+              stats.since = s.since || Date.now();
+              stats.events = s.events.slice(-MAX_STATS_EVENTS);
+              stats.totals = Object.assign(zeroTotals(), s.totals || {});
+              stats.queryCounts = s.queryCounts || {};
+            }
+          }
+        }
+      } catch (e) {}
+    })();
+  }
+  return statsLoadPromise;
+}
+
+function persistStats(env, ctx) {
+  try {
+    if (env && env.FILTER_STATS && typeof env.FILTER_STATS.put === 'function') {
+      const put = env.FILTER_STATS.put(STATS_KV_KEY, JSON.stringify(stats)).catch(() => {});
+      if (ctx && ctx.waitUntil) ctx.waitUntil(put);
+    }
+  } catch (e) {}
+}
+
+function logStats(env, ctx, ev) {
+  ev.id = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+  ev.ts = Date.now();
+  stats.events.push(ev);
+  if (stats.events.length > MAX_STATS_EVENTS) {
+    stats.events.splice(0, stats.events.length - MAX_STATS_EVENTS);
+  }
+  if (ev.type === 'search') {
+    stats.totals.blockedSearches++;
+    const k = normText(ev.q) || String(ev.q || '');
+    stats.queryCounts[k] = (stats.queryCounts[k] || 0) + 1;
+  } else if (ev.type === 'results') {
+    stats.totals.removedTiles += ev.count || (ev.removed || []).length;
+  } else if (ev.type === 'product') {
+    stats.totals.blockedProducts++;
+  }
+  persistStats(env, ctx);
+}
+
+/* ================================================================== */
 /* Router                                                              */
 /* ================================================================== */
 
 export default {
-  async fetch(request, _env, ctx) {
+  async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS });
     }
+
+    const url = new URL(request.url);
+    const p = (url.pathname || '/').replace(/\/+$/, '') || '/';
+
+    /* filter monitor: own password, independent of the access keys */
+    if (p === '/admin/stats' || p === '/admin/stats/reset') {
+      return handleAdmin(request, url, p, env, ctx);
+    }
+
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       return jsonResponse({ error: 'bad_request', message: 'GET only' }, 405);
     }
 
-    const url = new URL(request.url);
+    /* pulls the saved log from KV once per isolate (no-op without one) */
+    await loadStats(env);
 
     const profile = getAccessProfile(
       request.headers.get('x-access-key') || url.searchParams.get('key') || ''
@@ -470,8 +589,6 @@ export default {
       return jsonResponse({ error: 'unauthorized', message: 'Bad or missing access key' }, 401);
     }
 
-    const p = (url.pathname || '/').replace(/\/+$/, '') || '/';
-
     try {
       if (p === '/' || p === '/health') {
         return jsonResponse({ ok: true, service: 'amazon-relay', profile, ts: Date.now() });
@@ -479,9 +596,9 @@ export default {
       if (p === '/img') {
         return await proxyImage(ctx, url.searchParams.get('u') || '');
       }
-      if (p === '/api/search') return await handleSearch(url, ctx, profile);
-      if (p.startsWith('/api/product/')) return await handleProduct(url, ctx, profile);
-      if (p === '/api/browse') return await handleBrowse(url, ctx, profile);
+      if (p === '/api/search') return await handleSearch(url, ctx, profile, env);
+      if (p.startsWith('/api/product/')) return await handleProduct(url, ctx, profile, env);
+      if (p === '/api/browse') return await handleBrowse(url, ctx, profile, env);
 
       return jsonResponse({ error: 'not_found', message: 'Unknown route: ' + p }, 404);
     } catch (e) {
@@ -673,7 +790,12 @@ async function getAmazonHTML(target) {
 /* Edge cache (Cache API, TTL enforced in a wrapper object)            */
 /* ================================================================== */
 
-async function cachedJson(ctx, key, ttlSec, producer) {
+/* Caches the producer's data at the edge under a key and returns the
+ * DATA (not a Response) - callers still run their per-request logic
+ * (Safe Mode filtering + activity logging) on cache hits. The cached
+ * payload is worker-internal: it holds the RAW unfiltered extraction
+ * and is never sent anywhere until the caller has filtered it. */
+async function cachedData(ctx, key, ttlSec, producer) {
   const cache = caches.default;
   const req = new Request('https://jsoncache.relay/' + encodeURIComponent(key));
 
@@ -686,7 +808,7 @@ async function cachedJson(ctx, key, ttlSec, producer) {
     try {
       const wrap = JSON.parse(await hit.text());
       if (wrap && wrap.t && Date.now() - wrap.t < ttlSec * 1000 && wrap.d) {
-        return jsonResponse(wrap.d);
+        return wrap.d;
       }
     } catch (e) {}
   }
@@ -703,7 +825,7 @@ async function cachedJson(ctx, key, ttlSec, producer) {
     else await put;
   } catch (e) {}
 
-  return jsonResponse(data);
+  return data;
 }
 
 /* ================================================================== */
@@ -1499,7 +1621,83 @@ function assembleProduct(p) {
 /* Endpoints                                                           */
 /* ================================================================== */
 
-async function handleSearch(url, ctx, profile) {
+/* ---------- filter monitor (amazon-admin.html) ---------- */
+
+function safeEqual(a, b) {
+  a = String(a == null ? '' : a);
+  b = String(b == null ? '' : b);
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
+async function handleAdmin(request, url, p, env, ctx) {
+  const NO_STORE = { 'cache-control': 'no-store' };
+
+  if (!ADMIN_PASSWORD) {
+    return jsonResponse(
+      { error: 'forbidden', message: 'The admin monitor is disabled (ADMIN_PASSWORD is empty).' },
+      403,
+      NO_STORE
+    );
+  }
+
+  const key = request.headers.get('x-admin-key') || url.searchParams.get('adminKey') || '';
+  if (!safeEqual(key, ADMIN_PASSWORD)) {
+    return jsonResponse({ error: 'unauthorized', message: 'Bad or missing admin key' }, 401, NO_STORE);
+  }
+
+  await loadStats(env);
+
+  if (p === '/admin/stats') {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      return jsonResponse({ error: 'bad_request', message: 'GET only' }, 405, NO_STORE);
+    }
+    const events = stats.events.slice().reverse(); /* newest first */
+    const topQueries = Object.keys(stats.queryCounts)
+      .map((k) => [k, stats.queryCounts[k]])
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12);
+    return jsonResponse(
+      {
+        ok: true,
+        storage: env && env.FILTER_STATS ? 'kv' : 'memory',
+        since: stats.since,
+        now: Date.now(),
+        totals: stats.totals,
+        topQueries,
+        events,
+      },
+      200,
+      NO_STORE
+    );
+  }
+
+  if (p === '/admin/stats/reset') {
+    if (request.method !== 'POST' && request.method !== 'GET') {
+      return jsonResponse({ error: 'bad_request', message: 'POST (or GET) only' }, 405, NO_STORE);
+    }
+    stats.since = Date.now();
+    stats.events = [];
+    stats.totals = zeroTotals();
+    stats.queryCounts = {};
+    try {
+      if (env && env.FILTER_STATS && typeof env.FILTER_STATS.delete === 'function') {
+        const d = env.FILTER_STATS.delete(STATS_KV_KEY).catch(() => {});
+        if (ctx && ctx.waitUntil) ctx.waitUntil(d);
+        else await d;
+      }
+    } catch (e) {}
+    return jsonResponse({ ok: true, cleared: true }, 200, NO_STORE);
+  }
+
+  return jsonResponse({ error: 'not_found', message: 'Unknown admin route' }, 404, NO_STORE);
+}
+
+/* ---------- search ---------- */
+
+async function handleSearch(url, ctx, profile, env) {
   const q = (url.searchParams.get('q') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
   const i = url.searchParams.get('i') || '';
   const page = Math.min(50, Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1));
@@ -1508,23 +1706,31 @@ async function handleSearch(url, ctx, profile) {
   const idx = /^[a-z0-9-]{2,32}$/.test(i) ? i : '';
 
   if (profile === 'filtered') {
-    if (queryBlockedTerm(q)) {
+    const hit = queryBlockedTerm(q);
+    if (hit) {
+      logStats(env, ctx, { type: 'search', q, reason: hit, via: 'word' });
       return jsonResponse(
         { q, i: idx, page, blocked: true, results: [], hasMore: false, message: 'This search is blocked in Safe Mode.' },
-        200
+        200,
+        { 'cache-control': 'no-store' }
       );
     }
     if (idx && BLOCKED_DEPTS.indexOf(idx) >= 0) {
+      logStats(env, ctx, { type: 'search', q, reason: idx, via: 'category' });
       return jsonResponse(
         { q, i: idx, page, blocked: true, results: [], hasMore: false, message: 'This category is blocked in Safe Mode.' },
-        200
+        200,
+        { 'cache-control': 'no-store' }
       );
     }
   }
 
   const target = '/s?k=' + encodeURIComponent(q) + (idx ? '&i=' + idx : '') + '&page=' + page;
 
-  return cachedJson(ctx, 'search|' + profile + '|' + q.toLowerCase() + '|' + idx + '|' + page, TTL.search, async () => {
+  /* the RAW tile list is cached (one entry serves both profiles); Safe
+   * Mode filtering + logging run on every request so each attempt is
+   * recorded, cache hit or not */
+  const data = await cachedData(ctx, 'search|' + q.toLowerCase() + '|' + idx + '|' + page, TTL.search, async () => {
     const html = await getAmazonHTML(target);
     const { tiles } = await runExtractor(html, 'search', null);
     /* A page the relay could not read must NEVER look like "no results":
@@ -1533,47 +1739,111 @@ async function handleSearch(url, ctx, profile) {
     if (!tiles.length && !EMPTY_SEARCH_RE.test(html)) {
       throw new BlockedError('Search page was not readable');
     }
-    const results = profile === 'filtered' ? tiles.filter((t) => !tileBlocked(t)) : tiles;
-    /* hasMore follows the RAW tile count so a page whose items were all
-     * filtered out can still paginate to the next page */
-    return { q, i: idx, page, results, hasMore: tiles.length > 0 };
+    return { tiles, hasMore: tiles.length > 0 };
   });
+
+  let results = data.tiles;
+  if (profile === 'filtered') {
+    const kept = [];
+    const removed = [];
+    for (const t of data.tiles) {
+      const term = tileBlockedTerm(t);
+      if (term) removed.push({ title: String(t.title || '').slice(0, 140), asin: t.asin, reason: term });
+      else kept.push(t);
+    }
+    results = kept;
+    if (removed.length) {
+      logStats(env, ctx, {
+        type: 'results',
+        source: 'search',
+        q,
+        page,
+        removed: removed.slice(0, 25),
+        count: removed.length,
+        shown: kept.length,
+      });
+    }
+  }
+  /* hasMore follows the RAW tile count so a page whose items were all
+   * filtered out can still paginate to the next page */
+  return jsonResponse({ q, i: idx, page, results, hasMore: data.hasMore });
 }
 
-async function handleProduct(url, ctx, profile) {
+/* ---------- product ---------- */
+
+async function handleProduct(url, ctx, profile, env) {
   const m = url.pathname.match(/^\/api\/product\/([A-Z0-9]{10})$/i);
   if (!m) return jsonResponse({ error: 'bad_request', message: 'Bad ASIN' }, 400);
   const asin = m[1].toUpperCase();
 
-  return cachedJson(ctx, 'product|' + profile + '|' + asin, TTL.product, async () => {
+  /* the RAW product is cached (shared by both profiles); the Safe Mode
+   * verdict, sanitize and logging run on every request */
+  const data = await cachedData(ctx, 'product|' + asin, TTL.product, async () => {
     const html = await getAmazonHTML('/dp/' + asin);
     const { product, related } = await runExtractor(html, 'product', asin);
     if (!product.title && !product.images.length && !related.length) {
       throw new NotFoundError('Product not found or page not parseable');
     }
-    if (profile === 'filtered') {
-      if (productBlocked(product)) {
-        return { asin, blocked: true, message: 'This item is blocked in Safe Mode.' };
-      }
-      return sanitizeProduct(product, related);
-    }
-    return { ...product, related };
+    return { product, related };
   });
+
+  if (profile === 'filtered') {
+    const term = productBlockedTerm(data.product);
+    if (term) {
+      logStats(env, ctx, {
+        type: 'product',
+        asin,
+        title: String(data.product.title || '').slice(0, 140),
+        reason: term,
+      });
+      return jsonResponse(
+        { asin, blocked: true, message: 'This item is blocked in Safe Mode.' },
+        200,
+        { 'cache-control': 'no-store' }
+      );
+    }
+    return jsonResponse(sanitizeProduct(data.product, data.related));
+  }
+  return jsonResponse({ ...data.product, related: data.related });
 }
 
-async function handleBrowse(url, ctx, profile) {
+/* ---------- charts ---------- */
+
+async function handleBrowse(url, ctx, profile, env) {
   const typeRaw = url.searchParams.get('type') || 'bestsellers';
   const type = BROWSE_TYPES[typeRaw] || 'bestsellers';
   const cat = (url.searchParams.get('cat') || '').toLowerCase();
   const catOk = /^[a-z0-9-]{2,40}$/.test(cat) ? cat : '';
   const target = '/gp/' + type + (catOk ? '/' + catOk : '');
 
-  return cachedJson(ctx, 'browse|' + profile + '|' + type + '|' + catOk, TTL.browse, async () => {
+  const data = await cachedData(ctx, 'browse|' + type + '|' + catOk, TTL.browse, async () => {
     const html = await getAmazonHTML(target);
     const { tiles } = await runExtractor(html, 'browse', null);
     /* charts always contain tiles; zero means we were walled */
     if (!tiles.length) throw new BlockedError('Chart page was not readable');
-    const items = profile === 'filtered' ? tiles.filter((t) => !tileBlocked(t)) : tiles;
-    return { type, cat: catOk, items };
+    return { tiles };
   });
+
+  let items = data.tiles;
+  if (profile === 'filtered') {
+    const kept = [];
+    const removed = [];
+    for (const t of data.tiles) {
+      const term = tileBlockedTerm(t);
+      if (term) removed.push({ title: String(t.title || '').slice(0, 140), asin: t.asin, reason: term });
+      else kept.push(t);
+    }
+    items = kept;
+    if (removed.length) {
+      logStats(env, ctx, {
+        type: 'results',
+        source: 'browse',
+        q: type + (catOk ? ' - ' + catOk : ''),
+        removed: removed.slice(0, 25),
+        count: removed.length,
+        shown: kept.length,
+      });
+    }
+  }
+  return jsonResponse({ type, cat: catOk, items });
 }
