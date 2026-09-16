@@ -183,16 +183,43 @@ function getAccessProfile(key) {
 /* The editable list lives in the FILTER_STATS KV namespace under      */
 /* 'access-keys-v1' as [{id, key, label, profile, createdAt}]. The      */
 /* static map is EMPTY on purpose (preset keys were removed), so the    */
-/* live list is the only authority: add keys in the monitor's Keys      */
+/* saved list is the only authority: add keys in the monitor's Keys     */
 /* tab and they work immediately; revoke them and access stops.         */
+/*                                                                     */
+/* HOW THE LIST STAYS SAFE (the "keys randomly disappear" fix):        */
+/*  - the per-isolate cache re-reads KV every KEYS_TTL_MS instead of   */
+/*    once forever, and admin routes + every mutation force a fresh    */
+/*    read, so a booted-before-the-save isolate can never answer (or   */
+/*    write!) an empty list over keys that exist;                      */
+/*  - mutations always start from that fresh read (never the static    */
+/*    fallback) and the write is awaited, so adding a key can no       */
+/*    longer wipe the others;                                          */
+/*  - revokes leave id tombstones ('keys-deleted-v1'), so a slower     */
+/*    isolate cannot write a revoked key back;                         */
+/*  - an emptied list is SAVED as [] (not deleted), so "locked         */
+/*    everyone out on purpose" is never confused with "never           */
+/*    saved" and the static map never comes back.                      */
 /* Without a KV binding the list lives in worker memory only (see the   */
 /* monitor's storage note) - bind FILTER_STATS before handing out keys. */
 /* ================================================================== */
 
 const KEYS_KV_KEY = 'access-keys-v1';
+/* ids of revoked keys: a slower isolate that still holds an old copy of
+ * the list must never write a revoked key back (same tombstone idea the
+ * event log uses for its per-entry deletes) */
+const KEYS_DELETED_KV_KEY = 'keys-deleted-v1';
+const MAX_KEY_TOMBSTONES = 2000;
+/* how long an isolate may serve its cached copy of the key list before
+ * it re-reads KV. Revoking a key therefore takes hold everywhere within
+ * this window (plus KV's own cross-datacenter propagation). Admin
+ * routes always force a fresh read and never use the cache. */
+const KEYS_TTL_MS = 15000;
 
-let dynKeys = null; /* null = unset -> static ACCESS_KEYS rule */
-let dynKeysLoadPromise = null;
+let dynKeys = null; /* the SAVED list (array; [] = deliberately empty) */
+let dynKeysSaved = false; /* true once a list exists (KV read or a save) */
+let dynKeysAt = 0; /* when the cache above was filled */
+let dynKeysPromise = null; /* in-flight (re)load */
+let keysDeletedIds = new Set(); /* revoked key ids - the tombstones */
 
 function seedKeysFromStatic() {
   return Object.keys(ACCESS_KEYS).map((k) => ({
@@ -218,49 +245,104 @@ function normalizeKeyList(arr) {
       label: String(e.label || key).slice(0, 40),
       profile: e.profile === 'filtered' ? 'filtered' : 'full',
       createdAt: e.createdAt || 0,
+      updatedAt: e.updatedAt || e.createdAt || 0,
     });
   }
+  /* stable order: oldest first, same as the monitor displays them */
+  out.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   return out;
 }
 
-function loadDynKeys(env) {
-  if (!dynKeysLoadPromise) {
-    dynKeysLoadPromise = (async () => {
+/* raw KV read of the saved list + the revoke tombstones. Never throws:
+ * { kv:false } = no binding at all; { kv:true, list:null } = reachable
+ * but nothing saved (or the read failed - keep the previous cache then) */
+async function readKeysFromKV(env) {
+  if (!(env && env.FILTER_STATS && typeof env.FILTER_STATS.get === 'function')) {
+    return { kv: false };
+  }
+  try {
+    const raw = await env.FILTER_STATS.get(KEYS_KV_KEY);
+    const delRaw = await env.FILTER_STATS.get(KEYS_DELETED_KV_KEY);
+    if (delRaw) {
       try {
-        if (env && env.FILTER_STATS && typeof env.FILTER_STATS.get === 'function') {
-          const raw = await env.FILTER_STATS.get(KEYS_KV_KEY);
-          if (raw) {
-            const arr = JSON.parse(raw);
-            if (Array.isArray(arr)) dynKeys = normalizeKeyList(arr);
+        const d = JSON.parse(delRaw);
+        if (Array.isArray(d)) {
+          for (const id of d) keysDeletedIds.add(String(id));
+          if (keysDeletedIds.size > MAX_KEY_TOMBSTONES) {
+            keysDeletedIds = new Set(Array.from(keysDeletedIds).sort().slice(-MAX_KEY_TOMBSTONES));
           }
         }
       } catch (e) {}
-    })();
+    }
+    if (raw == null) return { kv: true, list: null };
+    let arr = null;
+    try {
+      arr = JSON.parse(raw);
+    } catch (e) {}
+    return { kv: true, list: Array.isArray(arr) ? arr : [] };
+  } catch (e) {
+    return { kv: true, list: null, err: true };
   }
-  return dynKeysLoadPromise;
 }
 
-/* the list that rules right now (seeded from the static map while the
- * editable list has never been saved) */
-async function effectiveKeys(env) {
-  await loadDynKeys(env);
-  return dynKeys && dynKeys.length ? dynKeys : seedKeysFromStatic();
+/* Fill the isolate's cache from KV. `force` bypasses the TTL (admin
+ * routes and every mutation use it, so the monitor always sees the
+ * truth and saves always start from the freshest list). A failed re-read
+ * keeps the previous cache instead of falling back to the empty static
+ * map - that fallback was why keys used to "randomly disappear". */
+function loadDynKeys(env, force) {
+  if (dynKeysPromise && !force && Date.now() - dynKeysAt < KEYS_TTL_MS) return dynKeysPromise;
+  const p = (async () => {
+    const r = await readKeysFromKV(env);
+    if (r.list != null) {
+      /* a saved list is authoritative - even when it is empty */
+      dynKeys = normalizeKeyList(r.list).filter((k) => !keysDeletedIds.has(k.id));
+      dynKeysSaved = true;
+    } else if (!r.err && !dynKeysSaved) {
+      /* KV reachable and truly nothing saved yet, and this isolate has
+       * never saved anything either: the static map still rules */
+      dynKeys = null;
+    }
+    /* r.err (transient read failure) or already-saved: keep the cache */
+    dynKeysAt = Date.now();
+  })();
+  dynKeysPromise = p;
+  return p;
 }
 
-async function saveKeyList(env, ctx, list) {
-  const norm = normalizeKeyList(list);
-  dynKeys = norm.length ? norm : null;
+/* the list that rules right now: the SAVED list once one exists (even
+ * an empty one - the static map never comes back after the first save),
+ * otherwise the static seed (read-only legacy) */
+async function effectiveKeys(env, force) {
+  await loadDynKeys(env, force);
+  if (dynKeysSaved) return dynKeys;
+  return seedKeysFromStatic();
+}
+
+/* the list a mutation starts from: NEVER the static fallback, so the
+ * first add cannot resurrect preset keys, and always freshly read */
+async function savedKeyList(env) {
+  await loadDynKeys(env, true);
+  return dynKeysSaved ? dynKeys.slice() : [];
+}
+
+/* write a mutated list: tombstones first (a revoke can never be undone
+ * by a slower isolate), then the list itself - always stored, even when
+ * empty, so "saved empty" stays distinct from "never saved". The write
+ * is awaited: when the admin page hears "ok" the change is durable. */
+async function commitKeyList(env, ctx, list, removedId) {
+  if (removedId) keysDeletedIds.add(String(removedId));
+  if (keysDeletedIds.size > MAX_KEY_TOMBSTONES) {
+    keysDeletedIds = new Set(Array.from(keysDeletedIds).sort().slice(-MAX_KEY_TOMBSTONES));
+  }
+  const norm = normalizeKeyList(list).filter((k) => !keysDeletedIds.has(k.id));
+  dynKeys = norm;
+  dynKeysSaved = true;
+  dynKeysAt = Date.now();
   try {
     if (env && env.FILTER_STATS && typeof env.FILTER_STATS.put === 'function') {
-      if (norm.length) {
-        const put = env.FILTER_STATS.put(KEYS_KV_KEY, JSON.stringify(norm)).catch(() => {});
-        if (ctx && ctx.waitUntil) ctx.waitUntil(put);
-        else await put;
-      } else if (typeof env.FILTER_STATS.delete === 'function') {
-        const del = env.FILTER_STATS.delete(KEYS_KV_KEY).catch(() => {});
-        if (ctx && ctx.waitUntil) ctx.waitUntil(del);
-        else await del;
-      }
+      await env.FILTER_STATS.put(KEYS_DELETED_KV_KEY, JSON.stringify(Array.from(keysDeletedIds))).catch(() => {});
+      await env.FILTER_STATS.put(KEYS_KV_KEY, JSON.stringify(norm)).catch(() => {});
     }
   } catch (e) {}
   return norm;
@@ -269,18 +351,15 @@ async function saveKeyList(env, ctx, list) {
 /* Access check for real requests: the live list when one exists, the
  * static map otherwise. Returns { profile, key } or null (401). The
  * returned key string rides along into the filter log so the monitor
- * can show WHO searched what. */
+ * can show WHO searched what. Uses the TTL cache - phone traffic never
+ * pays a KV read per request. */
 async function resolveAccess(keyStr, env) {
   await loadDynKeys(env);
   const k = String(keyStr == null ? '' : keyStr).trim();
-  if (dynKeys && dynKeys.length) {
-    const e = dynKeys.find((x) => x.key === k);
-    if (!e) return null;
-    return { profile: e.profile === 'filtered' ? 'filtered' : 'full', key: e.key };
-  }
-  const profile = getAccessProfile(k);
-  if (!profile) return null;
-  return { profile, key: k };
+  const list = dynKeysSaved ? dynKeys : seedKeysFromStatic();
+  const e = list.find((x) => x.key === k);
+  if (!e) return null;
+  return { profile: e.profile === 'filtered' ? 'filtered' : 'full', key: e.key };
 }
 
 /* ================================================================== */
@@ -704,10 +783,56 @@ function zeroTotals() {
 const stats = {
   since: 0, /* when tracking started */
   events: [], /* oldest first, capped at MAX_STATS_EVENTS */
-  totals: zeroTotals(),
-  queryCounts: {}, /* normalized blocked query -> how many times */
-  keyTotals: {}, /* access key -> zeroTotals()-shaped counters */
 };
+
+/* EVERY number the dashboard shows is derived from the surviving event
+ * list right here - the events ARE the single source of truth. There
+ * are no cumulative counters anymore: deleting an entry (the monitor's
+ * X) or clearing the log makes every card, per-person counter and
+ * top-query chip update as if the thing never happened, which is
+ * exactly what the admin page expects. */
+function deriveStats(events) {
+  const totals = zeroTotals();
+  const queryCounts = {};
+  const keyTotals = {};
+  for (const ev of events || []) {
+    if (!ev) continue;
+    const n = ev.type === 'results' ? ev.count || (ev.removed || []).length : 0;
+    if (ev.type === 'search') {
+      totals.searches++;
+      if (ev.outcome === 'denied') totals.deniedSearches++;
+      else if (ev.flagged) totals.flaggedSearches++;
+      else if (ev.outcome !== 'shown') {
+        totals.blockedSearches++;
+        const k = normText(ev.q) || String(ev.q || '');
+        if (k) queryCounts[k] = (queryCounts[k] || 0) + 1;
+      }
+    } else if (ev.type === 'results') {
+      if (ev.flagged) totals.flaggedTiles += n;
+      else totals.removedTiles += n;
+    } else if (ev.type === 'product') {
+      if (ev.flagged) totals.flaggedProducts++;
+      else totals.blockedProducts++;
+    }
+    /* per-person counters (the access key string is the index) */
+    if (ev.key) {
+      const kt = keyTotals[ev.key] || (keyTotals[ev.key] = zeroTotals());
+      if (ev.type === 'search') {
+        kt.searches++;
+        if (ev.outcome === 'denied') kt.deniedSearches++;
+        else if (ev.flagged) kt.flaggedSearches++;
+        else if (ev.outcome !== 'shown') kt.blockedSearches++;
+      } else if (ev.type === 'results') {
+        if (ev.flagged) kt.flaggedTiles += n;
+        else kt.removedTiles += n;
+      } else if (ev.type === 'product') {
+        if (ev.flagged) kt.flaggedProducts++;
+        else kt.blockedProducts++;
+      }
+    }
+  }
+  return { totals, queryCounts, keyTotals };
+}
 
 /* events at or before this timestamp were cleared by /admin/stats/reset */
 let clearedTs = 0;
@@ -747,9 +872,9 @@ function loadStats(env) {
             if (s && Array.isArray(s.events)) {
               stats.since = s.since || Date.now();
               stats.events = s.events.slice(-MAX_STATS_EVENTS);
-              stats.totals = Object.assign(zeroTotals(), s.totals || {});
-              stats.queryCounts = s.queryCounts || {};
-              stats.keyTotals = s.keyTotals || {};
+              /* totals / queryCounts / keyTotals in the blob are IGNORED:
+               * they are always re-derived from the events (see
+               * deriveStats), so a delete can never leave stale numbers */
             }
           }
           /* the reset tombstone: anything at or before it was cleared */
@@ -822,10 +947,10 @@ async function persistStats(env, ctx, awaitWrite) {
 }
 
 /* union of two log snapshots: events merge by id (newest survive the
- * MAX cap), counters merge per field with max() so they never go
- * backwards and never double-count, the reset tombstone drops
- * anything /admin/stats/reset cleared, and delSet drops events the
- * monitor deleted one-by-one */
+ * MAX cap), the reset tombstone drops anything /admin/stats/reset
+ * cleared, and delSet drops events the monitor deleted one-by-one.
+ * All counters are DERIVED from the surviving events - never merged
+ * or remembered - so what you see is exactly what is in the log. */
 function mergeStats(kv, local, delSet) {
   const keep = (ev) => {
     if (!ev || !ev.id) return false;
@@ -843,37 +968,8 @@ function mergeStats(kv, local, delSet) {
   const events = Array.from(byId.values()).sort((a, b) => (a.ts || 0) - (b.ts || 0));
   if (events.length > MAX_STATS_EVENTS) events.splice(0, events.length - MAX_STATS_EVENTS);
 
-  const totals = zeroTotals();
-  for (const side of [kv, local]) {
-    if (!side || !side.totals) continue;
-    for (const f of Object.keys(totals)) {
-      totals[f] = Math.max(totals[f], side.totals[f] || 0);
-    }
-  }
-
-  const queryCounts = {};
-  for (const side of [kv, local]) {
-    if (!side || !side.queryCounts) continue;
-    for (const k of Object.keys(side.queryCounts)) {
-      queryCounts[k] = Math.max(queryCounts[k] || 0, side.queryCounts[k] || 0);
-    }
-  }
-
-  const keyTotals = {};
-  for (const side of [kv, local]) {
-    if (!side || !side.keyTotals) continue;
-    for (const k of Object.keys(side.keyTotals)) {
-      const a = keyTotals[k] || {};
-      const b = side.keyTotals[k] || {};
-      for (const f of Object.keys(zeroTotals())) {
-        a[f] = Math.max(a[f] || 0, b[f] || 0);
-      }
-      keyTotals[k] = a;
-    }
-  }
-
   const since = Math.min((kv && kv.since) || Infinity, (local && local.since) || Infinity);
-  return { since: since === Infinity ? 0 : since, events, totals, queryCounts, keyTotals };
+  return Object.assign({ since: since === Infinity ? 0 : since, events }, deriveStats(events));
 }
 
 /* what /admin/stats answers: the freshest KV state merged with this
@@ -901,13 +997,8 @@ async function adminStatsView(env) {
     } catch (e) {}
     return mergeStats(kv, stats, deletedIds);
   }
-  return {
-    since: stats.since,
-    events: stats.events,
-    totals: stats.totals,
-    queryCounts: stats.queryCounts,
-    keyTotals: stats.keyTotals,
-  };
+  /* memory mode: derive straight from this isolate's events */
+  return Object.assign({ since: stats.since, events: stats.events }, deriveStats(stats.events));
 }
 
 function logStats(env, ctx, ev) {
@@ -917,46 +1008,9 @@ function logStats(env, ctx, ev) {
   if (stats.events.length > MAX_STATS_EVENTS) {
     stats.events.splice(0, stats.events.length - MAX_STATS_EVENTS);
   }
-  const n = ev.type === 'results' ? ev.count || (ev.removed || []).length : 0;
-  if (ev.type === 'search') {
-    /* EVERY search is logged; outcome says how it ended:
-     *   'shown'   - clean query, results delivered
-     *   'blocked' - the query itself was refused (word / category)
-     *   'denied'  - the query passed but the results page was mostly
-     *               filterable, so the whole request was denied
-     *   'flagged' - Unrestricted key: shown anyway, but the filter
-     *               would have caught it (flagged:true) */
-    stats.totals.searches++;
-    if (ev.outcome === 'denied') stats.totals.deniedSearches++;
-    else if (ev.flagged) stats.totals.flaggedSearches++;
-    else if (ev.outcome !== 'shown') {
-      stats.totals.blockedSearches++;
-      const k = normText(ev.q) || String(ev.q || '');
-      stats.queryCounts[k] = (stats.queryCounts[k] || 0) + 1;
-    }
-  } else if (ev.type === 'results') {
-    if (ev.flagged) stats.totals.flaggedTiles += n;
-    else stats.totals.removedTiles += n;
-  } else if (ev.type === 'product') {
-    if (ev.flagged) stats.totals.flaggedProducts++;
-    else stats.totals.blockedProducts++;
-  }
-  /* per-person counters (the access key string is the index) */
-  if (ev.key) {
-    const kt = stats.keyTotals[ev.key] || (stats.keyTotals[ev.key] = zeroTotals());
-    if (ev.type === 'search') {
-      kt.searches++;
-      if (ev.outcome === 'denied') kt.deniedSearches++;
-      else if (ev.flagged) kt.flaggedSearches++;
-      else if (ev.outcome !== 'shown') kt.blockedSearches++;
-    } else if (ev.type === 'results') {
-      if (ev.flagged) kt.flaggedTiles += n;
-      else kt.removedTiles += n;
-    } else if (ev.type === 'product') {
-      if (ev.flagged) kt.flaggedProducts++;
-      else kt.blockedProducts++;
-    }
-  }
+  /* no counters to maintain: every number is derived from the events
+   * (see deriveStats), so deletes and clears can never leave the
+   * dashboard showing ghosts */
   persistStats(env, ctx);
 }
 
@@ -2129,7 +2183,9 @@ async function handleAdmin(request, url, p, env, ctx) {
 
     if (p === '/admin/keys' && (request.method === 'GET' || request.method === 'HEAD')) {
       return jsonResponse(
-        { ok: true, storage: kvBound ? 'kv' : 'memory', keys: await effectiveKeys(env) },
+        /* force=true: the monitor always sees the freshest KV list,
+         * never this isolate's TTL cache */
+        { ok: true, storage: kvBound ? 'kv' : 'memory', keys: await effectiveKeys(env, true) },
         200,
         NO_STORE
       );
@@ -2143,14 +2199,17 @@ async function handleAdmin(request, url, p, env, ctx) {
       return jsonResponse({ error: 'bad_request', message: 'JSON body required' }, 400, NO_STORE);
     }
 
-    const list = await effectiveKeys(env);
+    /* mutations start from a FRESH KV read (never the static fallback)
+     * - this is what stops an add from wiping keys saved moments ago
+     * from another isolate */
+    const list = await savedKeyList(env);
 
     if (p === '/admin/keys/delete') {
       const id = String(body.id || '');
       const i = list.findIndex((x) => x.id === id);
       if (i < 0) return jsonResponse({ error: 'not_found', message: 'No key with that id' }, 404, NO_STORE);
       list.splice(i, 1);
-      const saved = await saveKeyList(env, ctx, list);
+      const saved = await commitKeyList(env, ctx, list, id);
       return jsonResponse({ ok: true, revoked: id, keys: saved }, 200, NO_STORE);
     }
 
@@ -2174,6 +2233,7 @@ async function handleAdmin(request, url, p, env, ctx) {
       entry.key = keyStr;
       entry.label = label || keyStr;
       entry.profile = profile;
+      entry.updatedAt = Date.now();
     } else {
       if (list.some((x) => x.key === keyStr)) {
         return jsonResponse({ error: 'conflict', message: 'That key already exists.' }, 409, NO_STORE);
@@ -2184,10 +2244,11 @@ async function handleAdmin(request, url, p, env, ctx) {
         label: label || keyStr,
         profile,
         createdAt: Date.now(),
+        updatedAt: Date.now(),
       };
       list.push(entry);
     }
-    const saved = await saveKeyList(env, ctx, list);
+    const saved = await commitKeyList(env, ctx, list);
     return jsonResponse({ ok: true, keys: saved }, 200, NO_STORE);
   }
 
@@ -2236,7 +2297,7 @@ async function handleAdmin(request, url, p, env, ctx) {
         totals: view.totals,
         topQueries,
         keyTotals: view.keyTotals,
-        keys: await effectiveKeys(env),
+        keys: await effectiveKeys(env, true), /* fresh: the monitor sees the truth */
         events,
       },
       200,
@@ -2250,9 +2311,7 @@ async function handleAdmin(request, url, p, env, ctx) {
     }
     stats.since = Date.now();
     stats.events = [];
-    stats.totals = zeroTotals();
-    stats.queryCounts = {};
-    stats.keyTotals = {};
+    /* no counters to zero - every number is derived from the events */
     clearedTs = Date.now();
     try {
       if (env && env.FILTER_STATS && typeof env.FILTER_STATS.put === 'function') {
