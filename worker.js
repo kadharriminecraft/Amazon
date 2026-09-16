@@ -12,9 +12,16 @@
    Endpoints (all GET, CORS: *):
      /health                                -> { ok: true, profile }
                                             profile = "full" or "filtered"
-     /api/search?q=...&page=N&i=INDEX       -> search results (JSON; in Safe
-                                              Mode a blocked query answers
-                                              { blocked: true, results: [] })
+     /api/search?q=...&i=INDEX              -> FIRST PAGE of results only, in
+                                              JSON (the worker never digs
+                                              deeper pages anymore). In
+                                              Normal Mode the request is
+                                              denied outright ({ blocked:
+                                              true, results: [] }) when the
+                                              query matches the filter OR
+                                              when most of page 1 gets
+                                              filtered away (see
+                                              SEARCH_DENY_RATIO below)
      /api/product/ASIN                      -> product details (JSON: gallery,
                                               bullets, description, detail
                                               table, A+ manufacturer content,
@@ -29,14 +36,19 @@
                                    (blocked searches, products removed from
                                    results and charts, refused product
                                    pages - each with the reason and the
-                                   access key that was used)
-     POST /admin/stats/reset    -> clear the log
+                                   access key that was used) PLUS every
+                                   clean search too: each search event says
+                                   who ran it and how it ended (shown /
+                                   blocked / denied / flagged)
+     POST /admin/stats/reset    -> clear the whole log
+     POST /admin/events/delete  -> remove ONE entry    {id}
      GET  /admin/keys           -> the live access-key list
      POST /admin/keys           -> add or edit a key  {id?, key, label, profile}
      POST /admin/keys/delete    -> revoke a key      {id}
      All need the admin password (ADMIN_PASSWORD below) as the header
      "x-admin-key" (or ?adminKey=). Pair this with amazon-admin.html - a
-     single-file dashboard that asks for the password, shows the log,
+     single-file dashboard that asks for the password, shows the log
+     (with per-person filtering and an X button on every entry),
      and has a Keys tab where you add, rename, re-mode or revoke access
      keys. profile "filtered" = Normal mode (the filter is enforced),
      "full" = Unrestricted. In Unrestricted mode nothing is hidden - but
@@ -51,9 +63,13 @@
      (Bind KV before managing keys; without it, key edits stick only to
      the isolate that saved them.)
 
-   Access control - TWO profiles (edit ACCESS_KEYS below):
-     "notblocked"        -> full     : normal, unrestricted browsing
-     "Missionary Amazon"  -> filtered : Safe Mode. Searches, results,
+   Access control - TWO profiles, NO preset keys:
+     There are NO built-in access keys anymore. Keys are created in the
+     Filter Monitor's Keys tab (see above) and live in the FILTER_STATS
+     KV namespace - until you add one there, every request is rejected
+     with 401. Bind the KV namespace BEFORE handing out keys; without
+     it, key edits stick only to the worker instance that saved them.
+     profile "filtered" = Normal mode. Searches, results,
                              charts and product pages containing adult
                              or sexual content are blocked here in the
                              worker -
@@ -67,10 +83,10 @@
                              Misspellings do NOT slip through: queries and
                              text are additionally matched against a
                              one-edit typo guard (see "typo guard" below).
-     Rename the keys or add your own (value must be "full" or
-     "filtered"). Requests must carry the key as the header
-     "x-access-key" (or ?key=<key>). Leave the map EMPTY {} to
-     disable the gate entirely (anyone with the URL gets full access).
+     Requests must carry a key as the header "x-access-key"
+     (or ?key=<key>). The static ACCESS_KEYS map below stays empty -
+     it only exists so the code keeps compiling if you ever hand-edit
+     a copy; the live KV list always wins.
 
    Cache wipe (for clean Safe Mode testing):
      GET /api/cache-wipe  -> drops every cached product page, search
@@ -103,15 +119,11 @@ const MOBILE_UA =
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
-/* Access-key -> profile map. 'full' = unrestricted, 'filtered' = Safe Mode.
- * Rename keys / add entries as you like; {} disables the gate entirely.
- * Keys are matched EXACTLY (after trimming spaces), capitals included.
- * You can also manage keys LIVE from the Filter Monitor's Keys tab
- * (no redeploy needed) - see "Live access keys" further down. */
-const ACCESS_KEYS = {
-  notblocked: 'full',
-  'Missionary Amazon': 'filtered',
-};
+/* Access keys are managed LIVE from the Filter Monitor's Keys tab -
+ * there are NO preset keys in this file anymore. Every key has to be
+ * added in the monitor; until then the gate rejects everything.
+ * Keys are matched EXACTLY (after trimming spaces), capitals included. */
+const ACCESS_KEYS = {};
 
 /* Password for the /admin/stats filter monitor (used by amazon-admin.html).
  * CHANGE THIS to your own secret. The monitor answers only to this
@@ -158,7 +170,8 @@ class NotFoundError extends Error {}
 /* ================================================================== */
 
 function getAccessProfile(key) {
-  if (!Object.keys(ACCESS_KEYS).length) return 'full'; // gate disabled
+  /* the static map is empty by design (no preset keys): everything is
+   * denied here and only the LIVE list from the Keys tab grants access */
   const k = String(key == null ? '' : key).trim();
   if (!Object.prototype.hasOwnProperty.call(ACCESS_KEYS, k)) return null;
   return ACCESS_KEYS[k] === 'filtered' ? 'filtered' : 'full';
@@ -168,13 +181,12 @@ function getAccessProfile(key) {
 /* Live access keys (managed from the Filter Monitor's Keys tab)       */
 /*                                                                     */
 /* The editable list lives in the FILTER_STATS KV namespace under      */
-/* 'access-keys-v1' as [{id, key, label, profile, createdAt}]. Until   */
-/* the first edit it is unset and the STATIC ACCESS_KEYS above rule;   */
-/* the monitor seeds the editable list from them. Once the list exists */
-/* it is the only authority - edit or delete the seeded entries there. */
-/* Deleting every entry hands control back to the static map, so an    */
-/* empty list can never lock everybody out. Without a KV binding the   */
-/* list lives in worker memory only (see the monitor's storage note).  */
+/* 'access-keys-v1' as [{id, key, label, profile, createdAt}]. The      */
+/* static map is EMPTY on purpose (preset keys were removed), so the    */
+/* live list is the only authority: add keys in the monitor's Keys      */
+/* tab and they work immediately; revoke them and access stops.         */
+/* Without a KV binding the list lives in worker memory only (see the   */
+/* monitor's storage note) - bind FILTER_STATS before handing out keys. */
 /* ================================================================== */
 
 const KEYS_KV_KEY = 'access-keys-v1';
@@ -312,12 +324,37 @@ const BLOCKED_TERMS = [
   'twerk', 'vagina', 'vibrator', 'viagra', 'whore', 'xrated', 'xxx', 'yaoi',
   'yuri',
 
+  /* expanded set ("skirt and much more"): more adult/sexual terms.
+   * Deliberately-misspelled-safe notes: 'creampie' is one word (the
+   * two-word "cream pie" dessert is a different spelling), 'doggy'
+   * alone stays allowed (pet toys), 'exotic' alone stays allowed
+   * (skincare, cars), 'pussy'/'dick'/'twat' are exact-word matches so
+   * Dickies work pants and 'dickens' are untouched. */
+  'aphrodisiac', 'aroused', 'barely legal', 'blow job', 'blowjob',
+  'bukkake', 'busty', 'call girl', 'camel toe', 'cameltoe', 'climax',
+  'clit', 'clitoral', 'creampie', 'cuckold', 'cunnilingus', 'curvy',
+  'dick', 'doggy style', 'domme', 'downblouse', 'exotic dancer',
+  'fellatio', 'gang bang', 'gangbang', 'hand job', 'handjob', 'hooters',
+  'hotwife', 'jailbait', 'jav', 'labia', 'lewd', 'nudity', 'open bust',
+  'open cup', 'orgy', 'pocket pussy', 'provocative', 'pussy',
+  'reverse cowgirl', 'rimjob', 'rule 34', 'schlong', 'seduce', 'spank',
+  'spanking', 'thicc', 'twat', 'uncensored', 'upskirt', 'voluptuous',
+  'vulva', 'yiff',
+
   'bakini', 'bandeau', 'bikini', 'bra', 'bralette', 'brassiere', 'bustier',
   'cami', 'camisole', 'chemise', 'corset', 'fishnet', 'g string', 'garter',
   'gstring', 'hosiery', 'intimate', 'intimates', 'jegging', 'knicker',
   'lingerie', 'microkini', 'monokini', 'negligee', 'panties', 'panty',
   'pantyhose', 'peignoir', 'shapewear', 'tanga', 'tankini', 'thigh high',
   'thighhigh', 'thong',
+
+  /* expanded set: inherently women's / intimate garment words. "skirt"
+   * was the explicit request - it also catches skirts / skater skirts
+   * via the stemmer (bed skirts are accepted collateral). 'stocking'
+   * stays OFF on purpose ("stocking stuffers" at Christmas); fishnet,
+   * pantyhose and thigh high cover the intimate versions. */
+  'backless', 'blouse', 'catsuit', 'culotte', 'frilly', 'girdle', 'lacy',
+  'nightie', 'palazzo', 'skirt', 'skort', 'strapless',
 
   'babydoll',
 
@@ -326,6 +363,12 @@ const BLOCKED_TERMS = [
   'low cut', 'micro mini', 'micro skirt', 'mini skirt', 'off shoulder',
   'sarong', 'short short', 'stiletto', 'tube top', 'waist trainer',
   'yoga pant',
+
+  /* expanded set: revealing / women's style words. "dress" alone stays
+   * OFF (dress shirts, dress socks, dressing up) - the specific styles
+   * are listed instead. */
+  'athleisure', 'high heel', 'mini dress', 'minidress', 'one shoulder',
+  'spaghetti strap', 'sun dress', 'sundress',
 
   'female', 'feminine', 'girl', 'girlie', 'girly', 'ladies', 'lady', 'missy',
   'teen', 'teenage', 'teens', 'woman', 'women',
@@ -484,6 +527,7 @@ for (const term of BLOCKED_TERMS) {
 const NEAR_EXEMPT = new Set([
   'logging', 'chemist', 'gaiter', 'gaiters', 'condor', 'cortex', 'hardware',
   'wedding', 'weddings', 'buster', 'vibrato', 'hustle', 'hardcode', 'kicker',
+  'arouse', /* one deletion from 'aroused' - book titles say "arouse curiosity" */
 ]);
 
 /* exact + fuzzy check of ONE already-normalized word */
@@ -634,11 +678,20 @@ function sanitizeProduct(p, related) {
 
 const STATS_KV_KEY = 'filter-stats-v1';
 const STATS_CLEARED_KV_KEY = 'filter-stats-cleared-v1';
+const STATS_DELETED_KV_KEY = 'stats-deleted-v1';
 const CACHE_GEN_KV_KEY = 'cache-generation-v1';
-const MAX_STATS_EVENTS = 500;
+/* every search is logged now (shown / blocked / denied / flagged), so
+ * the cap is higher than it used to be */
+const MAX_STATS_EVENTS = 1000;
+/* tombstones for events removed one-by-one from the monitor (the X
+ * button): without them a stale isolate that still holds the event
+ * would resurrect it on its next read-merge-write */
+const MAX_DELETED_IDS = 2000;
 
 function zeroTotals() {
   return {
+    searches: 0,
+    deniedSearches: 0,
     blockedSearches: 0,
     removedTiles: 0,
     blockedProducts: 0,
@@ -658,6 +711,18 @@ const stats = {
 
 /* events at or before this timestamp were cleared by /admin/stats/reset */
 let clearedTs = 0;
+
+/* ids of events deleted one-by-one from the monitor; they double as
+ * tombstones so concurrent isolates cannot write them back (same idea
+ * as clearedTs, but per-event). ids sort chronologically because they
+ * start with Date.now().toString(36). */
+let deletedIds = new Set();
+
+function pruneDeletedIds() {
+  if (deletedIds.size <= MAX_DELETED_IDS) return;
+  const keep = Array.from(deletedIds).sort().slice(deletedIds.size - MAX_DELETED_IDS);
+  deletedIds = new Set(keep);
+}
 
 let statsLoadPromise = null;
 
@@ -694,6 +759,17 @@ function loadStats(env) {
             clearedTs = tn;
             stats.events = stats.events.filter((ev) => (ev.ts || 0) > clearedTs);
           }
+          /* per-event deletion tombstones (the monitor's X button) */
+          const del = await env.FILTER_STATS.get(STATS_DELETED_KV_KEY);
+          if (del) {
+            try {
+              const arr = JSON.parse(del);
+              if (Array.isArray(arr)) {
+                deletedIds = new Set(arr.slice(-MAX_DELETED_IDS));
+                stats.events = stats.events.filter((ev) => ev && !deletedIds.has(ev.id));
+              }
+            } catch (e) {}
+          }
           const g = await env.FILTER_STATS.get(CACHE_GEN_KV_KEY);
           const n = parseInt(g || '', 10);
           if (!isNaN(n) && n > 0) cacheGen = n;
@@ -704,36 +780,65 @@ function loadStats(env) {
   return statsLoadPromise;
 }
 
-function persistStats(env, ctx) {
+async function persistStats(env, ctx, awaitWrite) {
   try {
     if (env && env.FILTER_STATS && typeof env.FILTER_STATS.put === 'function') {
       /* read-merge-write: the KV copy is re-read first and unioned with
        * this isolate's events BY ID, so a snapshot held by another
-       * isolate can never erase events it has not seen */
+       * isolate can never erase events it has not seen. The deletion
+       * tombstones are re-read fresh too, so an event removed via the
+       * monitor's X button stays removed no matter who writes next. */
       const job = (async () => {
         let kv = null;
+        let delRaw = null;
         try {
           const raw = await env.FILTER_STATS.get(STATS_KV_KEY);
           if (raw) kv = JSON.parse(raw);
+          delRaw = await env.FILTER_STATS.get(STATS_DELETED_KV_KEY);
         } catch (e) {}
-        await env.FILTER_STATS.put(STATS_KV_KEY, JSON.stringify(mergeStats(kv, stats)));
+        const delSet = new Set(deletedIds);
+        if (delRaw) {
+          try {
+            const d = JSON.parse(delRaw);
+            if (Array.isArray(d)) {
+              for (const id of d) delSet.add(id);
+            }
+          } catch (e) {}
+        }
+        deletedIds = delSet;
+        pruneDeletedIds();
+        const delJson = JSON.stringify(Array.from(deletedIds));
+        /* write the tombstone list back only when it changed (keeps the
+         * steady-state at one KV write per logged event) */
+        if (delJson !== (delRaw == null ? '[]' : delRaw)) {
+          await env.FILTER_STATS.put(STATS_DELETED_KV_KEY, delJson).catch(() => {});
+        }
+        await env.FILTER_STATS.put(STATS_KV_KEY, JSON.stringify(mergeStats(kv, stats, deletedIds)));
       })().catch(() => {});
-      if (ctx && ctx.waitUntil) ctx.waitUntil(job);
+      if (awaitWrite) await job;
+      else if (ctx && ctx.waitUntil) ctx.waitUntil(job);
     }
   } catch (e) {}
 }
 
 /* union of two log snapshots: events merge by id (newest survive the
  * MAX cap), counters merge per field with max() so they never go
- * backwards and never double-count, and the reset tombstone drops
- * anything /admin/stats/reset cleared */
-function mergeStats(kv, local) {
+ * backwards and never double-count, the reset tombstone drops
+ * anything /admin/stats/reset cleared, and delSet drops events the
+ * monitor deleted one-by-one */
+function mergeStats(kv, local, delSet) {
+  const keep = (ev) => {
+    if (!ev || !ev.id) return false;
+    if (delSet && delSet.has(ev.id)) return false;
+    if (clearedTs && (ev.ts || 0) <= clearedTs) return false;
+    return true;
+  };
   const byId = new Map();
   for (const ev of (kv && kv.events) || []) {
-    if (ev && ev.id && (!clearedTs || (ev.ts || 0) > clearedTs)) byId.set(ev.id, ev);
+    if (keep(ev)) byId.set(ev.id, ev);
   }
   for (const ev of (local && local.events) || []) {
-    if (ev && ev.id && (!clearedTs || (ev.ts || 0) > clearedTs)) byId.set(ev.id, ev);
+    if (keep(ev)) byId.set(ev.id, ev);
   }
   const events = Array.from(byId.values()).sort((a, b) => (a.ts || 0) - (b.ts || 0));
   if (events.length > MAX_STATS_EVENTS) events.splice(0, events.length - MAX_STATS_EVENTS);
@@ -776,14 +881,25 @@ function mergeStats(kv, local) {
 async function adminStatsView(env) {
   if (env && env.FILTER_STATS && typeof env.FILTER_STATS.get === 'function') {
     let kv = null;
+    let delSet = null;
     try {
       const raw = await env.FILTER_STATS.get(STATS_KV_KEY);
       if (raw) kv = JSON.parse(raw);
       const t = await env.FILTER_STATS.get(STATS_CLEARED_KV_KEY);
       const tn = parseInt(t || '', 10);
       if (!isNaN(tn) && tn > clearedTs) clearedTs = tn;
+      const del = await env.FILTER_STATS.get(STATS_DELETED_KV_KEY);
+      if (del) {
+        const d = JSON.parse(del);
+        if (Array.isArray(d)) {
+          delSet = new Set(d);
+          /* learn tombstones written by other isolates */
+          for (const id of d) deletedIds.add(id);
+          pruneDeletedIds();
+        }
+      }
     } catch (e) {}
-    return mergeStats(kv, stats);
+    return mergeStats(kv, stats, deletedIds);
   }
   return {
     since: stats.since,
@@ -803,8 +919,17 @@ function logStats(env, ctx, ev) {
   }
   const n = ev.type === 'results' ? ev.count || (ev.removed || []).length : 0;
   if (ev.type === 'search') {
-    if (ev.flagged) stats.totals.flaggedSearches++;
-    else {
+    /* EVERY search is logged; outcome says how it ended:
+     *   'shown'   - clean query, results delivered
+     *   'blocked' - the query itself was refused (word / category)
+     *   'denied'  - the query passed but the results page was mostly
+     *               filterable, so the whole request was denied
+     *   'flagged' - Unrestricted key: shown anyway, but the filter
+     *               would have caught it (flagged:true) */
+    stats.totals.searches++;
+    if (ev.outcome === 'denied') stats.totals.deniedSearches++;
+    else if (ev.flagged) stats.totals.flaggedSearches++;
+    else if (ev.outcome !== 'shown') {
       stats.totals.blockedSearches++;
       const k = normText(ev.q) || String(ev.q || '');
       stats.queryCounts[k] = (stats.queryCounts[k] || 0) + 1;
@@ -820,8 +945,10 @@ function logStats(env, ctx, ev) {
   if (ev.key) {
     const kt = stats.keyTotals[ev.key] || (stats.keyTotals[ev.key] = zeroTotals());
     if (ev.type === 'search') {
-      if (ev.flagged) kt.flaggedSearches++;
-      else kt.blockedSearches++;
+      kt.searches++;
+      if (ev.outcome === 'denied') kt.deniedSearches++;
+      else if (ev.flagged) kt.flaggedSearches++;
+      else if (ev.outcome !== 'shown') kt.blockedSearches++;
     } else if (ev.type === 'results') {
       if (ev.flagged) kt.flaggedTiles += n;
       else kt.removedTiles += n;
@@ -851,6 +978,7 @@ export default {
     if (
       p === '/admin/stats' ||
       p === '/admin/stats/reset' ||
+      p === '/admin/events/delete' ||
       p === '/admin/keys' ||
       p === '/admin/keys/delete'
     ) {
@@ -2063,6 +2191,32 @@ async function handleAdmin(request, url, p, env, ctx) {
     return jsonResponse({ ok: true, keys: saved }, 200, NO_STORE);
   }
 
+  if (p === '/admin/events/delete') {
+    if (request.method !== 'POST' && request.method !== 'GET') {
+      return jsonResponse({ error: 'bad_request', message: 'POST (or GET) only' }, 405, NO_STORE);
+    }
+    let body = null;
+    try {
+      body = await request.json();
+    } catch (e) {}
+    const id = String((body && body.id) || url.searchParams.get('id') || '');
+    if (!id || id.length > 64) {
+      return jsonResponse({ error: 'bad_request', message: 'Missing event id' }, 400, NO_STORE);
+    }
+    const had = stats.events.some((ev) => ev && ev.id === id);
+    stats.events = stats.events.filter((ev) => ev && ev.id !== id);
+    /* tombstone: isolates that still hold this event must not write it
+     * back on their next read-merge-write */
+    deletedIds.add(id);
+    pruneDeletedIds();
+    await persistStats(env, ctx, true);
+    return jsonResponse(
+      { ok: true, deleted: id, removed: had ? 1 : 0, storage: kvBound ? 'kv' : 'memory' },
+      200,
+      NO_STORE
+    );
+  }
+
   if (p === '/admin/stats') {
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       return jsonResponse({ error: 'bad_request', message: 'GET only' }, 405, NO_STORE);
@@ -2120,21 +2274,37 @@ async function handleAdmin(request, url, p, env, ctx) {
 
 /* ---------- search ---------- */
 
+/* FIRST PAGE ONLY. The worker used to let the app paginate (and the app
+ * auto-pulled up to 5 pages hunting for clean leftovers whenever Normal
+ * Mode emptied a page). Not anymore: one page is fetched, and when the
+ * filter removes most of it the WHOLE request is denied instead of
+ * digging for the few nitpick products whose titles happen to be
+ * worded cleanly. Deny when more results were blocked than allowed,
+ * or when at least this share of the page was blocked (the user's
+ * "like 60%"): */
+const SEARCH_DENY_RATIO = 0.6;
+
 async function handleSearch(url, ctx, profile, env, akey) {
   const q = (url.searchParams.get('q') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
   const i = url.searchParams.get('i') || '';
-  const page = Math.min(50, Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1));
   if (!q) return jsonResponse({ error: 'bad_request', message: 'Missing q parameter' }, 400);
+
+  /* the worker only ever loads the first page now - a page parameter
+   * from an old app session is ignored (the response always says
+   * hasMore:false, so current apps never ask for a second one) */
+  const page = 1;
 
   const idx = /^[a-z0-9-]{2,32}$/.test(i) ? i : '';
 
   const wordHit = queryBlockedTerm(q);
   const deptHit = idx && BLOCKED_DEPTS.indexOf(idx) >= 0 ? idx : null;
+  let queryCaught = false; /* a caught query logs exactly ONE search event */
   if (wordHit || deptHit) {
+    queryCaught = true;
     const reason = wordHit || deptHit;
     const via = wordHit ? 'word' : 'category';
     if (profile === 'filtered') {
-      logStats(env, ctx, { type: 'search', q, reason, via, key: akey });
+      logStats(env, ctx, { type: 'search', q, reason, via, outcome: 'blocked', key: akey });
       return jsonResponse(
         { q, i: idx, page, blocked: true, results: [], hasMore: false, message: 'The worker denied this search.' },
         200,
@@ -2143,7 +2313,7 @@ async function handleSearch(url, ctx, profile, env, akey) {
     }
     /* Unrestricted key: nothing is hidden, but the would-be catch is
      * logged as flagged so the monitor shows who searched it */
-    logStats(env, ctx, { type: 'search', q, reason, via, flagged: true, key: akey });
+    logStats(env, ctx, { type: 'search', q, reason, via, outcome: 'flagged', flagged: true, key: akey });
   }
 
   const target = '/s?k=' + encodeURIComponent(q) + (idx ? '&i=' + idx : '') + '&page=' + page;
@@ -2160,7 +2330,7 @@ async function handleSearch(url, ctx, profile, env, akey) {
     if (!tiles.length && !EMPTY_SEARCH_RE.test(html)) {
       throw new BlockedError('Search page was not readable');
     }
-    return { tiles, hasMore: tiles.length > 0 };
+    return { tiles };
   });
 
   let results = data.tiles;
@@ -2171,6 +2341,30 @@ async function handleSearch(url, ctx, profile, env, akey) {
       const term = tileBlockedTerm(t);
       if (term) removed.push({ title: String(t.title || '').slice(0, 140), asin: t.asin, reason: term });
       else kept.push(t);
+    }
+    const total = data.tiles.length;
+    const blockedN = removed.length;
+    const keptN = kept.length;
+    /* the whole-request deny: mostly-blocked page (or more blocked than
+     * allowed) means the search is clearly after something the filter
+     * refuses to serve - no digging through deeper pages for leftovers */
+    if (total && (blockedN > keptN || blockedN >= Math.ceil(SEARCH_DENY_RATIO * total))) {
+      logStats(env, ctx, {
+        type: 'search',
+        q,
+        reason: 'page',
+        via: 'ratio',
+        outcome: 'denied',
+        blocked: blockedN,
+        shown: keptN,
+        total,
+        key: akey,
+      });
+      return jsonResponse(
+        { q, i: idx, page, blocked: true, results: [], hasMore: false, message: 'The worker denied this search.' },
+        200,
+        { 'cache-control': 'no-store' }
+      );
     }
     results = kept;
     if (removed.length) {
@@ -2185,6 +2379,9 @@ async function handleSearch(url, ctx, profile, env, akey) {
         key: akey,
       });
     }
+    /* clean searches are logged too - who searched what, and that it
+     * went through (this is the bypass-hunting record) */
+    logStats(env, ctx, { type: 'search', q, outcome: 'shown', shown: keptN, key: akey });
   } else {
     /* Unrestricted key: every tile is shown, but the ones the filter
      * WOULD remove are logged as flagged ("not blocked, shown") */
@@ -2206,10 +2403,14 @@ async function handleSearch(url, ctx, profile, env, akey) {
         key: akey,
       });
     }
+    /* a caught query already logged its flagged event above - a clean
+     * run is the only case that logs "shown" */
+    if (!queryCaught) {
+      logStats(env, ctx, { type: 'search', q, outcome: 'shown', shown: data.tiles.length, key: akey });
+    }
   }
-  /* hasMore follows the RAW tile count so a page whose items were all
-   * filtered out can still paginate to the next page */
-  return jsonResponse({ q, i: idx, page, results, hasMore: data.hasMore });
+  /* first page only: there is never a second page to pull */
+  return jsonResponse({ q, i: idx, page, results, hasMore: false });
 }
 
 /* ---------- product ---------- */
